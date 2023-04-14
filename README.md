@@ -24,3 +24,5 @@ Input: input.mp3
 Output: nightcore_version.wav
 
 ```python MakeNightcore.py -s input.mp3```
+
+Made by Shyvadi
