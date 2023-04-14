@@ -5,7 +5,7 @@ is a command-line Python program that converts an input audio file to a Nightcor
 Before you begin, ensure you have the following dependencies installed:
 
 Python 3.6 or higher
-RubberBand Audio Time Stretcher
+RubberBand Audio Time Stretcher (Extract and add the exe to path)
 ffmpeg (required by PyDub)
 Install the required Python libraries:
 
