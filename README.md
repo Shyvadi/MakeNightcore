@@ -1,4 +1,4 @@
-#MakeNightcore
+# MakeNightcore
 is a command-line Python program that converts an input audio file to a Nightcore version by increasing the pitch and speed of the original audio. It uses the PyDub library for audio processing and RubberBand for pitch and speed change.
 
 #Prerequisites
