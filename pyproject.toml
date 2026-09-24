@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "makenightcore"
-version = "2.0.0"
+dynamic = ["version"]
 description = "Make nightcore versions of songs: faster and higher, like a record played at the wrong speed."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -24,6 +24,9 @@ test = ["pytest>=7"]
 
 [tool.setuptools]
 py-modules = ["MakeNightcore"]
+
+[tool.setuptools.dynamic]
+version = { attr = "MakeNightcore.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

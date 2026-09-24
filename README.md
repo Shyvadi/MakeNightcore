@@ -28,7 +28,7 @@ To set tempo and pitch separately, use `--tempo` and/or `--pitch`. The song is t
 
   Without Rubber Band, the tool falls back to ffmpeg's rubberband filter, or to ffmpeg's lower-quality `atempo` filter.
 
-To get a `makenightcore` command you can run from anywhere, install it with `pipx install .` or `uv tool install .`. Inside a virtual environment, `pip install .` works too. The installed command can't use the bundled Rubber Band, so on Windows put `rubberband.exe` on your `PATH` if you want it.
+To get a `makenightcore` command you can run from anywhere, install it with `pipx install .` or `uv tool install .`. Inside a virtual environment, `pip install .` works too. The installed command can't use the bundled Rubber Band. On Windows, if you want it, unzip it and add the folder with `rubberband.exe` and `sndfile.dll` to your `PATH`.
 
 ## Usage
 
@@ -47,8 +47,8 @@ python MakeNightcore.py song.mp3 --speed 0.8         # slowed down -> "song (Slo
 | Option | What it does |
 | --- | --- |
 | `INPUT ...` | Audio files, or folders of audio files. Subfolders are not searched. Wildcards such as `*.mp3` work in every shell, including on Windows. `-s INPUT` works too. |
-| `-o, --output PATH` | Output file. Without an extension, it gets the one the input's format calls for. With several inputs, `-o` names an output folder. The default is `<name> (Nightcore).<ext>` next to each input. Missing folders are created. |
-| `-f, --format FORMAT` | `mp3`, `m4a`, `ogg`, `opus`, `flac` or `wav`. The default keeps the input's format. Inputs in other formats become FLAC if they are lossless, and otherwise the format that matches their codec (MP3 if none does). |
+| `-o, --output PATH` | Output file or folder. It is a folder if it already is one, ends in `/`, or there are several inputs. A file without an extension gets the one the input's format calls for. The default is `<name> (Nightcore).<ext>` next to each input. Missing folders are created. |
+| `-f, --format FORMAT` | `mp3`, `m4a`, `ogg`, `opus`, `flac` or `wav`. The default keeps the input's format. Inputs in other formats become FLAC if they are lossless (Apple Lossless becomes M4A), and otherwise the format that matches their codec (MP3 if none does). |
 | `--speed X` | Speed-up factor. The pitch rises with it. The default is `1.25`. |
 | `--tempo X` | Tempo factor, without changing the pitch. |
 | `--pitch SEMITONES` | Pitch shift, without changing the tempo. |
@@ -72,7 +72,7 @@ Version 1 of this tool time-stretched with `rubberband -t 0.85 -p 3`. To get the
   - Lossless files stay lossless, at their bit depth and sample rate. 16-bit stays 16-bit (dithered), 24-bit stays 24-bit, and 32-bit float WAV stays float. Apple Lossless (ALAC) stays ALAC.
   - Lossy formats are encoded at transparent settings: MP3 V0, AAC 256k, Vorbis q6 or Opus 192k. If your ffmpeg has no Vorbis encoder, Ogg files are written with Opus.
   - All processing happens in floating point.
-- **No clipping.** A limiter stops peaks from going over full scale. Resampling can create small overs between samples, and bass boosts and time-stretching can create big ones. The limiter's ceiling is -0.1 dBFS for lossless files and -2 dBFS for lossy ones, whose encoders overshoot. It leaves everything below the ceiling alone. Without a bass boost or time-stretching, lossy files are not limited, just like any other conversion.
+- **No clipping.** A limiter stops peaks from going over full scale. Resampling can create small overs between samples, and bass boosts and Rubber Band's time-stretching can create big ones. The limiter's ceiling is -0.1 dBFS for lossless files and -2 dBFS for lossy ones, whose encoders overshoot. It leaves everything below the ceiling alone. Without a bass boost or Rubber Band, lossy files are not limited, just like any other conversion. Downmixes, to stereo for MP3 and for surround layouts Opus can't store, are normalized so they can't clip either.
 - **Tags.**
   - Tags are copied, and the title gets ` (Nightcore)` added.
   - The BPM tag is scaled to the new tempo, and the timestamps of synced lyrics are moved to match it.
@@ -80,7 +80,7 @@ Version 1 of this tool time-stretched with `rubberband -t 0.85 -p 3`. To get the
 - **Cover art.** The cover is kept in MP3, M4A and FLAC output; the front cover is used if there are several. Ogg, Opus and WAV can't carry it this way.
 - **Safety.**
   - Existing files are never overwritten unless you pass `-y`, and the source file is never overwritten at all.
-  - A failed or interrupted run doesn't leave a half-written file behind. That includes Ctrl+C, closing the terminal and `kill`.
+  - A failed or interrupted run doesn't leave a half-written file behind. That includes Ctrl+C, and on macOS and Linux also `kill` and closing the terminal.
   - One bad file doesn't stop a batch.
 - **Many inputs.** Pass several files, wildcards or whole folders. Earlier `(Nightcore)` results inside a folder are skipped. Any input ffmpeg can read works, including video files; only the audio is used.
 
