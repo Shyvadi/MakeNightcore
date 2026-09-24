@@ -15,6 +15,7 @@ Only ffmpeg is required. Run with --help for usage, or see README.md.
 from __future__ import annotations
 
 import argparse
+import array
 import collections
 import contextlib
 import functools
@@ -48,20 +49,25 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 BUNDLED_RUBBERBAND_ZIP = SCRIPT_DIR / "rubberband-3.2.1-gpl-executable-windows.zip"
 
 FORMATS = ("flac", "m4a", "mp3", "ogg", "opus", "wav")
+LOSSY_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)  # (MP3's and AAC's)
 COVER_ART_FORMATS = {".flac", ".m4a", ".mp3"}
 CHAPTER_FORMATS = {".m4a", ".mp3"}  # (ffmpeg writes Ogg chapters at the wrong times)
-# The channel layouts Opus and Vorbis can store.
+# The channel layouts Opus and Vorbis can store, and ffmpeg's AAC encoder.
 OGG_LAYOUTS = {"mono", "stereo", "3.0", "quad", "5.0", "5.1", "6.1", "7.1"}
+AAC_LAYOUTS = OGG_LAYOUTS | {"2.1", "3.1", "4.0", "4.1", "6.0", "7.0", "7.1(wide)", "hexagonal",
+                             "octagonal"}
+# The layouts FLAC and Ogg give audio that doesn't name its own.
+USUAL_LAYOUTS = {1: "mono", 2: "stereo", 3: "3.0", 4: "quad", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}
 # Layouts that Opus, Vorbis and AAC only take with their side channels relabelled as back ones.
 SIDES_AS_BACK = {"5.0(side)": "5.0", "5.1(side)": "5.1"}
 
 # Files picked up when a folder is given as input.
 INPUT_EXTENSIONS = {f".{fmt}" for fmt in FORMATS} | {
-    ".aac", ".aif", ".aifc", ".aiff", ".alac", ".ape", ".m4b", ".mka",
+    ".aac", ".aif", ".aifc", ".aiff", ".alac", ".ape", ".dff", ".dsf", ".m4b", ".mka",
     ".mkv", ".mov", ".mp4", ".oga", ".tak", ".tta", ".webm", ".wma", ".wv",
 }
-LOSSLESS_CODECS = {"alac", "ape", "flac", "mlp", "mp4als", "ralf", "s302m", "shorten", "tak",
-                   "truehd", "tta", "wavpack", "wmalossless"}
+LOSSLESS_CODECS = {"alac", "ape", "dst", "flac", "mlp", "mp4als", "osq", "ralf", "s302m", "shorten",
+                   "tak", "truehd", "tta", "wavpack", "wmalossless"}
 # Default output format for inputs whose own format can't be written back.
 CODEC_EXTENSIONS = {"aac": ".m4a", "alac": ".m4a", "flac": ".flac", "mp3": ".mp3",
                     "opus": ".opus", "vorbis": ".ogg"}
@@ -77,8 +83,11 @@ STALE_TAGS = {
 STALE_TAGS |= {"acoustid fingerprint", "acoustid id", "acoustid_fingerprint", "acoustid_id", "isrc",
                "musicbrainz release track id", "musicbrainz track id",
                "musicbrainz_releasetrackid", "musicbrainz_trackid", "tsrc"}
+# The same in WMA (ASF) files, and Matroska's key.
+STALE_TAGS |= {"acoustid/fingerprint", "acoustid/id", "initial_key", "musicbrainz/release track id",
+               "musicbrainz/track id", "wm/initialkey", "wm/isrc"}
 STALE_TAG_PREFIXES = ("replaygain_", "r128_", "_statistics_", "mp3gain_")
-BPM_TAGS = {"bpm", "tbpm", "tmpo"}
+BPM_TAGS = {"bpm", "tbpm", "tmpo", "wm/beatsperminute"}
 BPM_KEYS = {".flac": "BPM", ".m4a": "tmpo", ".mp3": "TBPM", ".ogg": "BPM", ".opus": "BPM"}
 LYRICS_TAGS = ("lyrics", "unsyncedlyrics")
 
@@ -331,19 +340,19 @@ def _rubberband_flags(rubberband: str) -> tuple:
 
 
 def _run(cmd: Sequence[str], *, verbose: bool = False, duration: float | None = None,
-         progress: Callable[[float], None] | None = None) -> list[bytes]:
+         progress: Callable[[float], None] | None = None, cwd: Path | None = None) -> None:
     """Run ffmpeg, raising NightcoreError with its message if it fails.
 
     Pass the expected output duration and a callback to receive progress.
-    Returns the last lines it printed.
     """
     cmd = [str(arg) for arg in cmd]
     if verbose:
-        _say("  $ " + _quote(cmd))
+        _say(f"  $ cd {_quote([str(cwd)])} && {_quote(cmd)}" if cwd else f"  $ {_quote(cmd)}")
     track = progress is not None and bool(duration)
     if track:
         cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
-    proc = _popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE if track else subprocess.DEVNULL)
+    proc = _popen(cmd, cwd=cwd, stderr=subprocess.PIPE,
+                  stdout=subprocess.PIPE if track else subprocess.DEVNULL)
     # Its messages are read on the side, so a chatty ffmpeg can't fill the pipe
     # and hang; only the last ones are kept.
     errors = collections.deque(maxlen=10)
@@ -356,7 +365,6 @@ def _run(cmd: Sequence[str], *, verbose: bool = False, duration: float | None = 
         reader.join()
     if returncode != 0:
         _failed(cmd, returncode, [line.decode("utf-8", "replace") for line in errors])
-    return list(errors)
 
 
 def _drain(pipe, lines: collections.deque) -> None:
@@ -367,14 +375,10 @@ def _drain(pipe, lines: collections.deque) -> None:
 def _follow_progress(lines: Iterable[bytes], duration: float,
                      progress: Callable[[float], None]) -> None:
     """Report the progress in ffmpeg's -progress output as a fraction."""
-    key = None
     for line in lines:
         name, _, value = line.decode("ascii", "replace").strip().partition("=")
-        # Both keys hold microseconds; older versions only have out_time_ms.
-        if name in ("out_time_us", "out_time_ms") and key in (None, name):
-            key = name
-            if value.isdigit():
-                progress(min(int(value) / 1e6 / duration, 1.0))
+        if name == "out_time_us" and value.isdigit():
+            progress(min(int(value) / 1e6 / duration, 1.0))
 
 
 def _run_rubberband(cmd: Sequence[str], *, cwd: Path, verbose: bool = False,
@@ -457,11 +461,13 @@ class Source:
     floating: bool = False    # floating-point PCM
     channels: int = 2
     layout: str = ""          # channel layout, e.g. "5.1(side)"
+    guessed: bool = False     # the file doesn't name its layout
     replaygain: bool = False  # ReplayGain in its tags or its header
     cover: int | None = None  # stream index of embedded cover art
     cover_codec: str = ""
     cover_type: str = ""      # e.g. "Cover (front)"
     chapters: tuple = ()      # (start, end, title), in seconds
+    start: float = 0.0        # when the audio starts in the file, if later than the rest
 
 
 def probe(path: Path, tools: Tools) -> Source:
@@ -480,9 +486,10 @@ def probe(path: Path, tools: Tools) -> Source:
         raise NightcoreError("the file contains no audio")
 
     codec = audio.get("codec_name", "")
-    lossless = (codec.startswith("pcm_") or codec in LOSSLESS_CODECS
+    lossless = (codec.startswith(("pcm_", "dsd_")) or codec in LOSSLESS_CODECS
                 or "DTS-HD MA" in audio.get("profile", ""))  # (a lossless DTS extension)
     is_float = codec.startswith("pcm_f")
+    decodes_to_float = audio.get("sample_fmt", "").startswith(("flt", "dbl"))  # (DSD does)
     bits = int(_number(audio.get("bits_per_raw_sample")) or _number(audio.get("bits_per_sample"))
                or (24 if audio.get("sample_fmt") in ("s32", "s32p") else 0))
     pictures = [s for s in streams if s.get("codec_type") == "video"
@@ -494,11 +501,11 @@ def probe(path: Path, tools: Tools) -> Source:
     # instead; elsewhere, stream tags are technical (e.g. Matroska's stats).
     tags = info.get("format", {}).get("tags") or audio.get("tags") or {}
     channels = int(_number(audio.get("channels"))) or 2
-    layout = audio.get("channel_layout", "unknown")
-    if layout == "unknown":  # e.g. plain WAV and AIFF files
-        layout = {1: "mono", 2: "stereo"}.get(channels, "")
     # A layout without a name, e.g. "2 channels (FC+LFE)", as old ffmpeg versions spell it.
-    layout = re.sub(r"^\d+ channels \((.+)\)$", r"\1", layout)
+    layout = re.sub(r"^\d+ channels \((.+)\)$", r"\1", audio.get("channel_layout", "unknown"))
+    guessed = layout == "unknown" or (channels == 1 and layout != "mono")  # (plain WAV, say)
+    if guessed:
+        layout = USUAL_LAYOUTS.get(channels, "")
     replaygain = (any(key.lower().startswith("replaygain_") for key in tags) or
                   any(d.get("side_data_type") == "Replay Gain" for d in audio.get("side_data_list", [])))
 
@@ -507,18 +514,21 @@ def probe(path: Path, tools: Tools) -> Source:
         codec=codec,
         sample_rate=int(_number(audio["sample_rate"])),
         duration=_number(info.get("format", {}).get("duration")) or _number(audio.get("duration")),
-        bits=24 if lossless and (bits > 16 or is_float) else 16,
+        bits=24 if lossless and (bits > 16 or decodes_to_float) else 16,
         lossless=lossless,
         tags=dict(tags),
         floating=is_float,
         channels=channels,
         layout=layout,
+        guessed=guessed,
         replaygain=replaygain,
         cover=picture.get("index"),
         cover_codec=picture.get("codec_name", ""),
         cover_type=picture.get("tags", {}).get("comment", ""),
         chapters=tuple((_number(c.get("start_time")), _number(c.get("end_time")),
                         c.get("tags", {}).get("title", "")) for c in info.get("chapters", [])),
+        start=max(0.0, _number(audio.get("start_time"))
+                  - _number(info.get("format", {}).get("start_time"))),
     )
 
 
@@ -609,26 +619,30 @@ def output_codec(ext: str, source: Source, ffmpeg: str) -> Codec:
         return Codec(("-c:a", "flac", "-compression_level", "8"), lossless=True)
     if ext == ".m4a" and source.codec == "alac":
         return Codec(("-c:a", "alac", "-movflags", "+faststart"), lossless=True)
-    # Bitrates are per channel pair (256k/192k for stereo); VBR modes scale themselves.
+    # A lossy format downmixes to stereo the layouts it can't store (and more than
+    # 8 channels without one, whose layout is ""). Bitrates are per channel pair
+    # (256k/192k for stereo); VBR modes scale themselves.
+    def downmix(layouts: set) -> bool:
+        return source.layout not in layouts and source.layout not in SIDES_AS_BACK
     if ext == ".m4a":
-        return Codec(("-c:a", "aac", "-b:a", f"{128 * source.channels}k", "-movflags", "+faststart"),
-                     sides_as_back=True)
+        mix = downmix(AAC_LAYOUTS)
+        return Codec(("-c:a", "aac", "-b:a", f"{128 * (2 if mix else source.channels)}k",
+                      "-movflags", "+faststart"), downmix=mix, sides_as_back=True)
     encoders = _ffmpeg_list(ffmpeg, "-encoders")
-    # Opus and Vorbis store up to 8 channels, in their own layouts. (Unnamed
-    # ones, as in plain WAV files, get those layouts, as in the other formats.)
-    unsupported = source.channels > 8 or (bool(source.layout) and source.layout not in OGG_LAYOUTS
-                                          and source.layout not in SIDES_AS_BACK)
     if ext == ".mp3":
         codec = Codec(("-c:a", "libmp3lame", "-q:a", "0"), downmix=source.channels > 2)  # LAME V0
     elif ext == ".ogg" and not (ogg_source and source.codec == "opus") and "libvorbis" in encoders:
-        codec = Codec(("-c:a", "libvorbis", "-q:a", "6"), downmix=unsupported, sides_as_back=True)
+        # (Vorbis also stores more than 8 channels, with no layout.)
+        codec = Codec(("-c:a", "libvorbis", "-q:a", "6"),
+                      downmix=bool(source.layout) and downmix(OGG_LAYOUTS), sides_as_back=True)
     else:  # .opus, and .ogg when the source is Opus or ffmpeg lacks Vorbis
         # ffmpeg puts 5 and 7 channels in the wrong speakers in Opus files. So they
         # get a silent LFE channel (5.1), or their back centre one split in two (7.1).
-        upmix = "" if unsupported else {5: "5.1", 7: "7.1"}.get(source.channels, "")
-        bitrate = 96 * (2 if unsupported else source.channels)  # (what's added costs little)
-        codec = Codec(("-c:a", "libopus", "-b:a", f"{bitrate}k"), opus=True,
-                      downmix=unsupported, sides_as_back=True, upmix=upmix)
+        mix = downmix(OGG_LAYOUTS)
+        upmix = "" if mix else {5: "5.1", 7: "7.1"}.get(source.channels, "")
+        bitrate = 96 * (2 if mix else source.channels)  # (what upmixing adds costs little)
+        codec = Codec(("-c:a", "libopus", "-b:a", f"{bitrate}k"), opus=True, downmix=mix,
+                      sides_as_back=True, upmix=upmix)
     if codec.args[1] not in encoders:
         raise NightcoreError(f"this ffmpeg can't write {ext[1:]} files "
                              f"(it has no {codec.args[1]} encoder); choose another format with -f")
@@ -656,9 +670,13 @@ def choose_engine(effect: Effect, requested: str, tools: Tools) -> tuple[str, st
 def _output_rate(rate: int, codec: Codec) -> int:
     if codec.opus:
         return 48000  # Opus only works at 48 kHz
-    if codec.lossless or rate <= 48000:
+    if codec.lossless:
         return rate
-    return 48000 if rate % 48000 == 0 else 44100  # lossy codecs gain nothing above 48 kHz
+    if rate > 48000:
+        return 48000 if rate % 48000 == 0 else 44100  # lossy codecs gain nothing above 48 kHz
+    # The nearest rate up that MP3 and AAC take. (Or ffmpeg would pick one itself,
+    # and convert to it with its plain resampler: 37.8 kHz would become 32 kHz.)
+    return next(standard for standard in LOSSY_RATES if standard >= rate)
 
 
 def _resample(rate: int, soxr: bool, from_rate: int) -> str:
@@ -671,7 +689,8 @@ def _resample(rate: int, soxr: bool, from_rate: int) -> str:
 
 
 def _atempo(factor: float) -> list[str]:
-    """atempo filters for any factor (old ffmpeg versions only allow 0.5-2 each)."""
+    """atempo filters for any factor. One takes 0.5 to 100, but above 2 it skips
+    input instead of blending it, so bigger factors are made in steps of 2."""
     steps = []
     while factor > 2:
         steps.append(2.0)
@@ -685,27 +704,31 @@ def _atempo(factor: float) -> list[str]:
 
 
 def audio_filters(source: Source, effect: Effect, engine: str, codec: Codec, ffmpeg: str,
-                  gain: float = 1) -> list[str]:
+                  decoded: bool = False) -> list[str]:
     """The ffmpeg filter chain that applies the effect and prepares the output.
 
-    `gain` is how much the audio was amplified before (for Rubber Band), to undo.
+    `decoded` says whether the input is a decoded copy (which starts at 0).
     """
     soxr = _has_soxr(ffmpeg)
     rate = _output_rate(source.sample_rate, codec)
     ratio = 2 ** (effect.pitch / 12)  # the pitch change as a frequency ratio
     chain = []
-    if engine == "rubberband" and source.layout:
-        # The Rubber Band program worked on a WAV file, which lost the channel layout.
+    if source.layout and (engine == "rubberband" or source.guessed):
+        # Name the layout: a WAV copy made by Rubber Band lost it, and a file that
+        # doesn't name it gets the usual one (not ffmpeg's guess: see probe).
         chain.append(f"channelmap=channel_layout={source.layout}")
-    # Start at the first sample, also where the audio starts late in its file (in
-    # a video, say), and process in floating point: no clipping along the way.
-    chain += ["asetpts=PTS-STARTPTS", "aformat=sample_fmts=fltp"]
+    if source.start > 0.001 and not decoded:
+        # Start at once where the audio starts late in its file (in a video, say).
+        # (Not with STARTPTS: ffmpeg rebuilds the filters when the format changes.)
+        chain.append(f"asetpts=PTS-{source.start:.6f}/TB")
+    chain.append("aformat=sample_fmts=fltp")  # floating point: no clipping along the way
     if codec.downmix:
         # Normalized, as ffmpeg's own downmix of floating-point audio can go far
         # over full scale, and first, so the limiter sees what is written.
         chain += ["aresample=rematrix_maxval=1", "aformat=channel_layouts=stereo"]
     elif codec.sides_as_back and source.layout in SIDES_AS_BACK:
-        chain.append(f"channelmap=channel_layout={SIDES_AS_BACK[source.layout]}")
+        # (Exactly, and unlike channelmap, also where the layout changes midway.)
+        chain.append(f"aformat=channel_layouts={SIDES_AS_BACK[source.layout]}")
     if codec.upmix:
         chain.append(f"aformat=channel_layouts={codec.upmix}")
 
@@ -727,8 +750,6 @@ def audio_filters(source: Source, effect: Effect, engine: str, codec: Codec, ffm
         if engine == "ffmpeg-rubberband":
             chain.append(f"rubberband=tempo={effect.tempo:.8f}:pitch={ratio:.8f}"
                          ":pitchq=quality:channels=together")  # together: keeps the stereo image
-        elif gain != 1:
-            chain.append(f"volume={1 / gain:.8g}")
         if rate != source.sample_rate:
             chain.append(_resample(rate, soxr, source.sample_rate))
     if effect.bass:
@@ -755,44 +776,98 @@ def _limiter(ffmpeg: str, ceiling: float, rate: int) -> str:
         return limiter + ":latency=1"  # keep the audio in sync
     # Before ffmpeg 5.1 it delays the audio by its 5 ms attack, less a sample.
     delay = int(rate * 0.005) - 1
-    return f"apad=pad_len={delay},{limiter},atrim=start_sample={delay},asetpts=PTS-STARTPTS"
+    return f"apad=pad_len={delay},{limiter},atrim=start_sample={delay},asetpts=PTS-{delay}/SR/TB"
 
 
 def _decode(source: Source, output: Path, tools: Tools, verbose: bool,
-            progress: Callable[[float], None] | None, volume: float = 1) -> Path:
-    """Decode the audio to a floating-point WAV file."""
-    _run([tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-          "-i", source.path, "-map", "0:a:0", "-map_metadata", "-1", "-af", f"volume={volume:.8g}",
+            progress: Callable[[float], None] | None, gains: Sequence[float] = (1.0,)) -> Path:
+    """Decode the audio to a floating-point WAV file, times `gains` (see _ride)."""
+    return _amplify(source.path, output, gains, source, 1, tools, verbose, progress)
+
+
+# Rubber Band's output can't go over full scale, and time-stretched audio peaks up
+# to 10 dB higher than the source (square waves do). So its input peaks at -12 dBFS.
+# And its R3 engine takes audio below about -57 dBFS for silence, and puts it out
+# at the wrong pitch. So quiet parts are raised as far, with a gain that follows
+# the level (a "gain ride"), and lowered again afterwards.
+RIDE_RATE = 20  # gains per second
+CURVE_RATE = 400  # values per second in the files that take them to ffmpeg
+
+
+def _levels(source: Source, workdir: Path, tools: Tools, verbose: bool,
+            progress: Callable[[float], None] | None) -> list[float]:
+    """The audio's peak in each 1/20 s ([] if ffmpeg doesn't say)."""
+    block = max(1, round(source.sample_rate / RIDE_RATE))
+    _run([tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", source.path,
+          "-map", "0:a:0", "-af", f"asetnsamples=n={block},astats=metadata=1:reset=1:"
+          "measure_perchannel=none:measure_overall=Peak_level,ametadata=mode=print:"
+          "key=lavfi.astats.Overall.Peak_level:file=levels.txt", "-f", "null", "-"],
+         cwd=workdir, verbose=verbose, duration=source.duration, progress=progress)
+    found = re.findall(r"pts_time:(-?[\d.]+)\s+\S+=(\S+)", (workdir / "levels.txt").read_text())
+    levels = []
+    for time, level in found:  # (in dB: "-inf" in silence)
+        index = round((float(time) - float(found[0][0])) * RIDE_RATE)
+        levels += [0.0] * (index + 1 - len(levels))
+        levels[index] = max(levels[index], 10 ** (float(level) / 20))
+    return levels
+
+
+def _ride(levels: Sequence[float]) -> list[float]:
+    """Gains, per 1/20 s, that bring the peaks within half a second to -12 dBFS
+    and change by at most 24 dB a second."""
+    reach, step = RIDE_RATE // 2, 24 / RIDE_RATE
+    # (A peak far over full scale is taken for a glitch, and can't push the rest down.)
+    peaks = [min(max(levels[max(0, i - reach): i + reach + 1]), 2.0) for i in range(len(levels))]
+    gains = [20 * math.log10(0.25 / max(peak, 0.00025)) for peak in peaks or [1.0]]
+    for i in range(1, len(gains)):
+        gains[i] = min(gains[i], gains[i - 1] + step)
+    for i in reversed(range(len(gains) - 1)):
+        gains[i] = min(gains[i], gains[i + 1] + step)
+    return [10 ** (gain / 20) for gain in gains]
+
+
+def _amplify(audio: Path, output: Path, gains: Sequence[float], source: Source, speed: float,
+             tools: Tools, verbose: bool, progress: Callable[[float], None] | None) -> Path:
+    """Write `audio` times `gains` (per 1/20 s, which `speed` moves to 1/20/speed s)
+    to a floating-point WAV file."""
+    cmd = [tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", audio]
+    if len(set(gains)) == 1:
+        graph = f"[0:a:0]volume={gains[0]:.8g}[out]"
+    else:
+        logs = [math.log(gain) for gain in gains]
+
+        def gain_at(time: float) -> float:  # (in between, as the inverse gains would be)
+            position = min(max(time * RIDE_RATE, 0.0), len(logs) - 1.0)
+            i = int(position)
+            return math.exp(logs[i] + (logs[min(i + 1, len(logs) - 1)] - logs[i]) * (position - i))
+        count = round((len(gains) / RIDE_RATE / speed + 1) * CURVE_RATE)  # (and a second more)
+        curve = array.array("f", (gain_at(n * speed / CURVE_RATE) for n in range(count)))
+        if sys.byteorder == "big":
+            curve.byteswap()
+        output.with_suffix(".gain").write_bytes(curve.tobytes())
+        # Every channel times the curve, both in the audio's own layout. (A copy
+        # made by Rubber Band has lost it: see audio_filters. And pan can't make
+        # every layout itself.)
+        layout = f"channelmap=channel_layout={source.layout}"
+        relabel = layout if audio != source.path or source.guessed else "anull"
+        spread = "|".join(f"c{channel}=c0" for channel in range(source.channels))
+        cmd += ["-f", "f32le", "-ar", str(CURVE_RATE), "-i", output.with_suffix(".gain")]
+        graph = (f"[0:a:0]{relabel}[audio];[1:a]aresample={source.sample_rate},"
+                 f"pan={source.channels}c|{spread},{layout}[gain];[audio][gain]amultiply[out]")
+    _run([*cmd, "-filter_complex", graph, "-map", "[out]", "-map_metadata", "-1",
           "-c:a", "pcm_f32le", "-rf64", "auto", output],
-         verbose=verbose, duration=source.duration, progress=progress)
+         verbose=verbose, duration=source.duration / speed, progress=progress)
     return output
 
 
-def _peak(source: Source, tools: Tools, verbose: bool,
-          progress: Callable[[float], None] | None) -> float:
-    """The audio's highest sample value (1, full scale, if ffmpeg doesn't say)."""
-    messages = _run([tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "info", "-i", source.path,
-                     "-map", "0:a:0", "-af", "astats=measure_perchannel=none:measure_overall=Peak_level",
-                     "-f", "null", "-"],
-                    verbose=verbose, duration=source.duration, progress=progress)
-    levels = re.findall(rb"Peak level dB: (-inf|-?\d+(?:\.\d+)?)\s*$", b"".join(messages), re.M)
-    return 10 ** (float(levels[-1]) / 20) if levels else 1.0
-
-
 def _stretch_with_rubberband(source: Source, effect: Effect, rubberband: str, workdir: Path,
-                             tools: Tools, verbose: bool, steps: _Progress) -> tuple[Path, float]:
+                             tools: Tools, verbose: bool, steps: _Progress) -> Path:
     """Time-stretch with the Rubber Band program, on a decoded copy: it can't
-    read most formats, and the copy gets the headroom it needs.
-
-    Returns the file, and the gain it was given, which the caller undoes.
-    """
-    # Its output can't go over full scale, and time-stretched audio peaks up to
-    # 10 dB higher than the source (square waves do). So the peaks go to -12 dBFS.
-    # Quiet audio is raised to that too: Rubber Band's R3 engine handles audio
-    # below about -57 dBFS as silence, and puts it out at the wrong pitch.
-    peak = _peak(source, tools, verbose, steps.stage(0.02))
-    gain = 0.25 / max(peak, 0.00025)
-    decoded = _decode(source, workdir / "decoded.wav", tools, verbose, steps.stage(0.05), gain)
+    read most formats, and the copy gets the levels it needs (see RIDE_RATE)."""
+    gains = _ride(_levels(source, workdir, tools, verbose, steps.stage(0.03)))
+    if not source.layout:  # (more than 8 channels: ffmpeg before 6.1 can't spread a curve)
+        gains = [min(gains)]
+    decoded = _decode(source, workdir / "decoded.wav", tools, verbose, steps.stage(0.05), gains)
     stretched = workdir / "stretched.wav"
     # File names relative to the work folder: on Windows, Rubber Band can only
     # open paths that fit the system code page, and the temp folder may not.
@@ -803,7 +878,9 @@ def _stretch_with_rubberband(source: Source, effect: Effect, rubberband: str, wo
     # It reports success even when it couldn't write it all (a full disk).
     if _duration(stretched, tools) < 0.99 * _duration(decoded, tools) / effect.tempo:
         raise NightcoreError(f"Rubber Band stopped early (is the temp folder {workdir.parent} full?)")
-    return stretched, gain
+    decoded.unlink()
+    return _amplify(stretched, workdir / "restored.wav", [1 / gain for gain in gains], source,
+                    effect.tempo, tools, verbose, steps.stage(0.02))
 
 
 class _Progress:
@@ -832,22 +909,21 @@ def render(source: Source, output: Path, effect: Effect, engine: str, tools: Too
     steps = _Progress(progress)
 
     # Write next to the destination first, so a failed or interrupted run
-    # never leaves a half-written file behind under the real name. (And find
-    # out now, not after a long stretch, if the folder can't be written to.)
+    # never leaves a half-written file behind under the real name. (Named
+    # before it exists, so no moment of an interruption can leave it behind.)
+    partial = output.parent / f".nightcore-{os.urandom(6).hex()}{ext}"
     try:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(dir=output.parent, prefix=".nightcore-", suffix=ext)
-    except OSError as error:
-        raise NightcoreError(f"can't write to {output.parent}: {error.strerror}") from None
-    os.close(fd)
-    partial = Path(name)
-    partial.unlink()  # let ffmpeg create it, with normal permissions
-    try:
+        try:  # find out now, not after a long stretch, if the folder can't be written to
+            output.parent.mkdir(parents=True, exist_ok=True)
+            partial.touch(exist_ok=False)
+        except OSError as error:
+            raise NightcoreError(f"can't write to {output.parent}: {error.strerror}") from None
+        partial.unlink()  # let ffmpeg create it, with normal permissions
         with _work_folder(prefix="nightcore-") as workdir:
-            audio, gain = source.path, 1.0
+            audio = source.path
             if engine == "rubberband":
-                audio, gain = _stretch_with_rubberband(source, effect, rubberband, workdir,
-                                                       tools, verbose, steps)
+                audio = _stretch_with_rubberband(source, effect, rubberband, workdir,
+                                                 tools, verbose, steps)
             elif ext == ".mp3" and source.replaygain:
                 # ffmpeg passes the source's ReplayGain on to the MP3 encoder, which
                 # writes it (now wrong) into the file's header. A decoded copy has none.
@@ -859,7 +935,8 @@ def render(source: Source, output: Path, effect: Effect, engine: str, tools: Too
                         for start, end, title in source.chapters if ext in CHAPTER_FORMATS]
             tag_file, tag_arguments = _ffmetadata(output_tags(source, effect, ext), chapters)
             tags.write_bytes(tag_file)
-            filters = audio_filters(source, effect, engine, codec, tools.ffmpeg, gain)
+            filters = audio_filters(source, effect, engine, codec, tools.ffmpeg,
+                                    decoded=audio != source.path)
             duration = source.duration / effect.tempo
             encoding = steps.stage(1 - steps.done)
             cover = source.cover if ext in COVER_ART_FORMATS else None
@@ -987,9 +1064,9 @@ def _check_extension(output: Path, fmt: str | None) -> str:
     """The extension of an output file ('' if none), which must be a format we write."""
     ext = _extension(output)
     if ext and ext[1:] not in FORMATS:
-        raise NightcoreError(f"unsupported output format {ext!r} (choose from {', '.join(FORMATS)})")
+        raise ValueError(f"unsupported output format {ext!r} (choose from {', '.join(FORMATS)})")
     if ext and fmt and ext[1:] != fmt:
-        raise NightcoreError(f"the format {fmt} does not match the output file {output.name}")
+        raise ValueError(f"the format {fmt} does not match the output file {output.name}")
     return ext
 
 
@@ -1022,8 +1099,9 @@ def nightcore(source: str | os.PathLike, output: str | os.PathLike | None = None
 
     With no options, this speeds the song up by 1.25x like a record player.
     Pass `tempo` and/or `pitch` (semitones) instead of `speed` to change them
-    independently. `output` is a file or a folder, like the command line's -o;
-    by default the result is "<name> (Nightcore).<ext>" next to the source.
+    independently. `output` is a file or a folder, like the command line's -o: a
+    folder if it is one or a string ending in "/" (a Path drops the slash). By
+    default the result is "<name> (Nightcore).<ext>" next to the source.
     """
     effect = make_effect(speed, tempo, pitch, bass)
     if engine not in ENGINES:
@@ -1057,8 +1135,10 @@ LABELS = (" (Nightcore)", " (Slowed)")
 def _skip_earlier_results(files: list[Path]) -> tuple[list[Path], list[Path]]:
     """Leave out earlier results that are given along with their originals
     (as when running `*.mp3` again). Returns (files to do, files left out)."""
-    def key(path: Path) -> str:
-        return os.path.normcase(os.path.abspath(path))
+    def key(path: Path):
+        # Files that exist by identity: the file system may ignore case or Unicode
+        # normalization (as macOS's do), so the names can differ.
+        return _file_id(path) or os.path.normcase(os.path.abspath(path))
     # The names the inputs' results would have (as default_output makes them),
     # and which inputs they would be made from.
     extensions = {path.suffix for path in files if path.stem.endswith(LABELS)}
@@ -1066,8 +1146,8 @@ def _skip_earlier_results(files: list[Path]) -> tuple[list[Path], list[Path]]:
     for path in files:
         for suffix in (label + ext for label in LABELS for ext in extensions):
             results[key(path.parent / _output_name(path.stem, suffix))].add(key(path))
-    skipped = [path for path in files if results[key(path)] - {key(path)}]
-    return [path for path in files if path not in skipped], skipped
+    earlier = {path for path in files if results[key(path)] - {key(path)}}
+    return [path for path in files if path not in earlier], [p for p in files if p in earlier]
 
 
 def _file_id(path: Path) -> tuple | None:
@@ -1075,7 +1155,7 @@ def _file_id(path: Path) -> tuple | None:
         info = os.stat(path)
     except OSError:
         return None
-    return info.st_dev, info.st_ino
+    return (info.st_dev, info.st_ino) if info.st_ino else None  # (some network shares: 0)
 
 
 def expand_inputs(names: Iterable[str]) -> tuple[list[Path], list[str], list[Path]]:
@@ -1310,6 +1390,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         names = [name[:-1] + "\\" if name.endswith('"') else name for name in names]
         if args.output and args.output.endswith('"'):
             args.output = args.output[:-1] + "\\"
+        for name in names + [args.output or ""]:
+            if '"' in name:  # (no file name has one: it took the arguments after it along)
+                parser.error(f"{name}: a quoted name ending in \\ takes the rest of the command "
+                             "line with it; leave off the final \\")
     if not names:
         parser.error("no input files given")
     stretch = args.tempo is not None or args.pitch is not None
@@ -1332,8 +1416,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     files, earlier = _skip_earlier_results(files + results)
     # In a folder, also those without their original (moved away, say). A
     # download that is named so can still be given by name.
-    unmatched = [path for path in results if path not in earlier]
-    files = [path for path in files if path not in unmatched]
+    left_out = set(earlier)
+    unmatched = [path for path in results if path not in left_out]
+    left_out.update(unmatched)
+    files = [path for path in files if path not in left_out]
     for path in earlier:
         status.info(f"skipping {path.name}: an earlier result")
     for path in unmatched:
@@ -1356,7 +1442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not folder:
             try:
                 _check_extension(output, args.format)
-            except NightcoreError as error:
+            except ValueError as error:
                 parser.error(str(error))
 
     try:

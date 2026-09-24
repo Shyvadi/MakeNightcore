@@ -17,7 +17,7 @@ To set tempo and pitch separately, use `--tempo` and/or `--pitch`. The song is t
 ## Requirements
 
 - **Python 3.8 or newer.** No Python packages are needed.
-- **[ffmpeg](https://ffmpeg.org/)**, available on your `PATH`:
+- **[ffmpeg](https://ffmpeg.org/) 4.2 or newer** (4.4 and newer are tested), available on your `PATH`:
   - Windows: `winget install Gyan.FFmpeg`. You can also unzip an ffmpeg build into a folder next to `MakeNightcore.py`.
   - macOS: `brew install ffmpeg`. Homebrew's full build, `brew install ffmpeg-full`, adds the SoX resampler and Vorbis. MakeNightcore finds it even though Homebrew keeps it off your `PATH`.
   - Linux: `sudo apt install ffmpeg`, or your distribution's equivalent.
@@ -28,7 +28,7 @@ To set tempo and pitch separately, use `--tempo` and/or `--pitch`. The song is t
 
   Without Rubber Band, the tool falls back to ffmpeg's rubberband filter, or to ffmpeg's lower-quality `atempo` filter.
 
-To get a `makenightcore` command you can run from anywhere, install it with `pipx install .` or `uv tool install .`. Inside a virtual environment, `pip install .` works too. The installed command can't use the bundled Rubber Band. On Windows, if you want it, unzip it and add the folder with `rubberband.exe` and `sndfile.dll` to your `PATH`.
+To get a `makenightcore` command you can run from anywhere, install it with `pipx install .` or `uv tool install .`. Inside a virtual environment, `pip install .` works too. The installed command can't use the bundled Rubber Band, or an ffmpeg unzipped next to `MakeNightcore.py`, so put them on your `PATH` (for example with `winget install Gyan.FFmpeg`). For Rubber Band on Windows, unzip it and add the folder with `rubberband.exe` and `sndfile.dll` to your `PATH`.
 
 ## Usage
 
@@ -71,9 +71,9 @@ Version 1 of this tool time-stretched with `rubberband -t 0.85 -p 3`. To get the
 - **Quality.**
   - Lossless files stay lossless, at their bit depth and sample rate. 16-bit stays 16-bit (dithered), 24-bit stays 24-bit, and 32-bit float WAV stays float. Apple Lossless (ALAC) stays ALAC.
   - Lossy formats are encoded at transparent settings: MP3 V0, Vorbis q6, and AAC 256k or Opus 192k for stereo (scaled with the number of channels). If your ffmpeg has no Vorbis encoder, Ogg files are written with Opus.
-  - Surround sound keeps its channels. It is downmixed to stereo for MP3, and in Ogg and Opus files for layouts those can't store.
+  - Surround sound keeps its channels. It is downmixed to stereo for MP3, and in M4A, Ogg and Opus files for layouts those can't store.
   - All processing happens in floating point.
-- **No clipping.** A limiter stops peaks from going over full scale. Resampling can create small overs between samples, and bass boosts and Rubber Band's time-stretching can create big ones. The limiter's ceiling is -0.1 dBFS for lossless files and -2 dBFS for lossy ones, whose encoders overshoot. It leaves everything below the ceiling alone. (ffmpeg's AAC encoder can overshoot by more on loud, dense songs, especially with `--bass`, so an M4A file may still go over full scale for a moment. MP3, Vorbis and Opus stay below it.) Without a bass boost or Rubber Band, lossy files are not limited, just like any other conversion. Downmixes, to stereo for MP3 and for surround layouts Opus and Vorbis can't store, are normalized so they can't clip either.
+- **No clipping.** A limiter stops peaks from going over full scale. Resampling can create small overs between samples, and bass boosts and Rubber Band's time-stretching can create big ones. The limiter's ceiling is -0.1 dBFS for lossless files and -2 dBFS for lossy ones, whose encoders overshoot. It leaves everything below the ceiling alone. (ffmpeg's AAC encoder can overshoot by more on loud, dense songs, especially with `--bass`, so an M4A file may still go over full scale for a moment. MP3, Vorbis and Opus stay below it.) Without a bass boost or Rubber Band, lossy files are not limited, just like any other conversion. Downmixes, to stereo for MP3 and for surround layouts that AAC, Opus and Vorbis can't store, are normalized so they can't clip either.
 - **Tags.**
   - Tags are copied, and the title gets ` (Nightcore)` added.
   - The BPM tag is scaled to the new tempo. Chapters (in MP3 and M4A output) and the timestamps of synced lyrics move to match it.
@@ -96,7 +96,7 @@ nightcore("song.mp3", "nightcore/", format="opus")      # into a folder
 nightcore("song.mp3", tempo=1.2, pitch=3, overwrite=True)
 ```
 
-`output` works like `-o`, and each option matches the command-line option of the same name. Invalid options raise `ValueError`. Other problems raise `NightcoreError`, or `OSError` when the file system fails. Warnings are issued with Python's `warnings` module.
+`output` works like `-o`: a folder if it is one or a string ending in `/` (a `Path` drops the slash, so create the folder first), and otherwise a file. Each option matches the command-line option of the same name. Invalid options raise `ValueError`. Other problems raise `NightcoreError`, or `OSError` when the file system fails. Warnings are issued with Python's `warnings` module.
 
 ## Development
 
