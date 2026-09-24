@@ -8,6 +8,7 @@ jobs:
   test:
     name: ${{ matrix.os }}, Python ${{ matrix.python }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20  # the suite takes a few minutes; a hang shouldn't take six hours
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +48,7 @@ jobs:
     # with Python 3.8.
     name: ffmpeg 4.4, Rubber Band 2.0, Python 3.8
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     container: ubuntu:22.04
     steps:
       - name: Install ffmpeg, Rubber Band and uv

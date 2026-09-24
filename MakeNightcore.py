@@ -49,9 +49,10 @@ BUNDLED_RUBBERBAND_ZIP = SCRIPT_DIR / "rubberband-3.2.1-gpl-executable-windows.z
 
 FORMATS = ("flac", "m4a", "mp3", "ogg", "opus", "wav")
 COVER_ART_FORMATS = {".flac", ".m4a", ".mp3"}
-# The channel layouts Opus can store.
-OPUS_LAYOUTS = {"mono", "stereo", "3.0", "quad", "5.0", "5.1", "6.1", "7.1"}
-# Layouts that Opus and AAC only take with their side channels relabelled as back ones.
+CHAPTER_FORMATS = {".m4a", ".mp3"}  # (ffmpeg writes Ogg chapters at the wrong times)
+# The channel layouts Opus and Vorbis can store.
+OGG_LAYOUTS = {"mono", "stereo", "3.0", "quad", "5.0", "5.1", "6.1", "7.1"}
+# Layouts that Opus, Vorbis and AAC only take with their side channels relabelled as back ones.
 SIDES_AS_BACK = {"5.0(side)": "5.0", "5.1(side)": "5.1"}
 
 # Files picked up when a folder is given as input.
@@ -72,7 +73,11 @@ STALE_TAGS = {
     "major_brand", "minor_version", "number_of_bytes", "number_of_frames", "tkey",
     "tlen", "vendor_id",
 }
-STALE_TAG_PREFIXES = ("replaygain_", "r128_", "_statistics_")
+# Identifiers of the original recording (and a fingerprint of its audio).
+STALE_TAGS |= {"acoustid fingerprint", "acoustid id", "acoustid_fingerprint", "acoustid_id", "isrc",
+               "musicbrainz release track id", "musicbrainz track id",
+               "musicbrainz_releasetrackid", "musicbrainz_trackid", "tsrc"}
+STALE_TAG_PREFIXES = ("replaygain_", "r128_", "_statistics_", "mp3gain_")
 BPM_TAGS = {"bpm", "tbpm", "tmpo"}
 BPM_KEYS = {".flac": "BPM", ".m4a": "tmpo", ".mp3": "TBPM", ".ogg": "BPM", ".opus": "BPM"}
 LYRICS_TAGS = ("lyrics", "unsyncedlyrics")
@@ -173,6 +178,8 @@ def _search_dirs() -> list[Path]:
         dirs += sorted(p for p in SCRIPT_DIR.glob(pattern) if p.is_dir())
     if os.name == "nt":
         dirs += sorted(p for p in _cache_dir().glob("rubberband*") if p.is_dir())
+    if sys.platform == "darwin":  # Homebrew's, which isn't on PATH when started by Finder or cron
+        dirs += [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
     return dirs
 
 
@@ -186,12 +193,13 @@ def _cache_dir() -> Path:
 
 
 def find_program(*names: str, near: str | None = None) -> str | None:
-    """Find a program on PATH, or else next to `near` or next to this script."""
+    """Find a program on PATH, or else next to the program `near` (the file
+    itself, if that is a link), or else next to this script."""
     for name in names:
         found = shutil.which(name)
         if found:
             return os.path.abspath(found)  # (programs may run in another folder)
-    extra = ([os.path.dirname(near)] if near else []) + [str(d) for d in _search_dirs()]
+    extra = ([os.path.dirname(os.path.realpath(near))] if near else []) + list(map(str, _search_dirs()))
     for name in names:
         found = shutil.which(name, path=os.pathsep.join(extra))
         if found:
@@ -227,8 +235,9 @@ def find_rubberband() -> str | None:
     if found is None and os.name == "nt" and BUNDLED_RUBBERBAND_ZIP.is_file():
         try:
             _unpack(BUNDLED_RUBBERBAND_ZIP, _cache_dir())
-        except (OSError, zipfile.BadZipFile):
-            return None
+        except (OSError, zipfile.BadZipFile) as error:
+            raise NightcoreError(f"the bundled Rubber Band could not be unpacked into "
+                                 f"{_cache_dir()}: {_describe(error)}") from None
         found = find_program("rubberband", "rubberband-r3")
     return found
 
@@ -261,16 +270,24 @@ def _work_folder(**options):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+# On Windows, hide the console window a program gets when there is none to share
+# (under pythonw). A shared console is unaffected, so Ctrl+C still reaches them.
+HIDDEN = {}
+if os.name == "nt":
+    HIDDEN["startupinfo"] = subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESHOWWINDOW,
+                                                   wShowWindow=subprocess.SW_HIDE)
+
+
 def _capture(cmd: Sequence[str]) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(list(cmd), stdin=subprocess.DEVNULL, capture_output=True)
+        return subprocess.run(list(cmd), stdin=subprocess.DEVNULL, capture_output=True, **HIDDEN)
     except OSError as error:
         raise NightcoreError(f"could not run {Path(cmd[0]).name}: {error.strerror or error}") from None
 
 
 def _popen(cmd: Sequence[str], **kwargs) -> subprocess.Popen:
     try:
-        return subprocess.Popen(list(cmd), stdin=subprocess.DEVNULL, **kwargs)
+        return subprocess.Popen(list(cmd), stdin=subprocess.DEVNULL, **kwargs, **HIDDEN)
     except OSError as error:
         raise NightcoreError(f"could not run {Path(cmd[0]).name}: {error.strerror or error}") from None
 
@@ -314,14 +331,15 @@ def _rubberband_flags(rubberband: str) -> tuple:
 
 
 def _run(cmd: Sequence[str], *, verbose: bool = False, duration: float | None = None,
-         progress: Callable[[float], None] | None = None) -> None:
+         progress: Callable[[float], None] | None = None) -> list[bytes]:
     """Run ffmpeg, raising NightcoreError with its message if it fails.
 
     Pass the expected output duration and a callback to receive progress.
+    Returns the last lines it printed.
     """
     cmd = [str(arg) for arg in cmd]
     if verbose:
-        print("  $ " + _quote(cmd), flush=True)
+        _say("  $ " + _quote(cmd))
     track = progress is not None and bool(duration)
     if track:
         cmd[1:1] = ["-progress", "pipe:1", "-nostats"]
@@ -338,6 +356,7 @@ def _run(cmd: Sequence[str], *, verbose: bool = False, duration: float | None = 
         reader.join()
     if returncode != 0:
         _failed(cmd, returncode, [line.decode("utf-8", "replace") for line in errors])
+    return list(errors)
 
 
 def _drain(pipe, lines: collections.deque) -> None:
@@ -363,7 +382,7 @@ def _run_rubberband(cmd: Sequence[str], *, cwd: Path, verbose: bool = False,
     """Run the Rubber Band program, following the progress it prints."""
     cmd = [str(arg) for arg in cmd]
     if verbose:
-        print(f"  $ cd {_quote([str(cwd)])} && {_quote(cmd)}", flush=True)
+        _say(f"  $ cd {_quote([str(cwd)])} && {_quote(cmd)}")
     proc = _popen(cmd, cwd=cwd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     messages, token, current = [], bytearray(), 0
     with _reaped(proc):
@@ -397,7 +416,7 @@ def _reaped(proc: subprocess.Popen):
         if os.name == "nt" and proc.poll() is None:
             # Its children too: Chocolatey's ffmpeg.exe is a shim that runs the real one.
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           stdin=subprocess.DEVNULL, capture_output=True)
+                           stdin=subprocess.DEVNULL, capture_output=True, **HIDDEN)
         proc.kill()
         proc.wait()
         raise
@@ -410,7 +429,9 @@ def _reaped(proc: subprocess.Popen):
 def _failed(cmd: Sequence[str], returncode: int, lines: Iterable[str]) -> None:
     lines = [line for line in (line.strip() for line in lines) if line]
     if not lines:  # ffmpeg's exit code is an error number when it can't say more
-        reason = f" ({os.strerror(256 - returncode)})" if 128 < returncode < 256 else ""
+        # -28 comes back as 228 (as 4294967268 on Windows); 255 means it was stopped.
+        number = -returncode % 256
+        reason = f" ({os.strerror(number)})" if returncode > 128 and 1 < number < 128 else ""
         lines = [f"exit code {returncode}{reason}"]
     detail = "\n".join("  " + line for line in lines[-10:])
     raise NightcoreError(f"{Path(cmd[0]).stem} failed:\n{detail}")
@@ -440,11 +461,12 @@ class Source:
     cover: int | None = None  # stream index of embedded cover art
     cover_codec: str = ""
     cover_type: str = ""      # e.g. "Cover (front)"
+    chapters: tuple = ()      # (start, end, title), in seconds
 
 
 def probe(path: Path, tools: Tools) -> Source:
     result = _capture([tools.ffprobe, "-v", "error", "-print_format", "json",
-                       "-show_format", "-show_streams", str(path)])
+                       "-show_format", "-show_streams", "-show_chapters", str(path)])
     if result.returncode != 0:
         lines = result.stderr.decode("utf-8", "replace").strip().splitlines()
         reason = lines[-1] if lines else "unknown error"
@@ -458,7 +480,8 @@ def probe(path: Path, tools: Tools) -> Source:
         raise NightcoreError("the file contains no audio")
 
     codec = audio.get("codec_name", "")
-    lossless = codec.startswith("pcm_") or codec in LOSSLESS_CODECS
+    lossless = (codec.startswith("pcm_") or codec in LOSSLESS_CODECS
+                or "DTS-HD MA" in audio.get("profile", ""))  # (a lossless DTS extension)
     is_float = codec.startswith("pcm_f")
     bits = int(_number(audio.get("bits_per_raw_sample")) or _number(audio.get("bits_per_sample"))
                or (24 if audio.get("sample_fmt") in ("s32", "s32p") else 0))
@@ -494,6 +517,8 @@ def probe(path: Path, tools: Tools) -> Source:
         cover=picture.get("index"),
         cover_codec=picture.get("codec_name", ""),
         cover_type=picture.get("tags", {}).get("comment", ""),
+        chapters=tuple((_number(c.get("start_time")), _number(c.get("end_time")),
+                        c.get("tags", {}).get("title", "")) for c in info.get("chapters", [])),
     )
 
 
@@ -541,9 +566,9 @@ def _retime_lyrics(text: str, tempo: float) -> str:
     return re.sub(r"\[(\d+):(\d\d(?:\.\d+)?)\]", retime, text)
 
 
-def _ffmetadata(tags: dict) -> tuple[bytes, list[str]]:
-    """Tags in ffmpeg's metadata file format, which has no length limits,
-    plus -metadata arguments for the rare ones that format can't hold."""
+def _ffmetadata(tags: dict, chapters: Iterable[tuple] = ()) -> tuple[bytes, list[str]]:
+    """Tags and chapters in ffmpeg's metadata file format, which has no length
+    limits, plus -metadata arguments for the rare tags that format can't hold."""
     def escape(text: str) -> str:
         return re.sub(r"([=;#\\\n\r])", r"\\\1", text)
     lines, arguments = [";FFMETADATA1\n"], []
@@ -552,6 +577,10 @@ def _ffmetadata(tags: dict) -> tuple[bytes, list[str]]:
             arguments += ["-metadata", f"{key}={value}"]
         else:
             lines.append(f"{escape(key)}={escape(value)}\n")
+    for start, end, title in chapters:
+        title = escape(title.rstrip("\\"))  # (a trailing one would make the reader run on too)
+        lines.append(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={round(start * 1000)}\n"
+                     f"END={round(end * 1000)}\ntitle={title}\n")
     return "".join(lines).encode("utf-8", "replace"), arguments
 
 
@@ -567,6 +596,7 @@ class Codec:
     opus: bool = False
     downmix: bool = False   # to stereo: the format can't store the source's channels
     sides_as_back: bool = False  # the format needs side channels relabelled as back ones
+    upmix: str = ""         # a layout with one more channel, which the format needs
 
 
 def output_codec(ext: str, source: Source, ffmpeg: str) -> Codec:
@@ -584,15 +614,21 @@ def output_codec(ext: str, source: Source, ffmpeg: str) -> Codec:
         return Codec(("-c:a", "aac", "-b:a", f"{128 * source.channels}k", "-movflags", "+faststart"),
                      sides_as_back=True)
     encoders = _ffmpeg_list(ffmpeg, "-encoders")
+    # Opus and Vorbis store up to 8 channels, in their own layouts. (Unnamed
+    # ones, as in plain WAV files, get those layouts, as in the other formats.)
+    unsupported = source.channels > 8 or (bool(source.layout) and source.layout not in OGG_LAYOUTS
+                                          and source.layout not in SIDES_AS_BACK)
     if ext == ".mp3":
         codec = Codec(("-c:a", "libmp3lame", "-q:a", "0"), downmix=source.channels > 2)  # LAME V0
     elif ext == ".ogg" and not (ogg_source and source.codec == "opus") and "libvorbis" in encoders:
-        codec = Codec(("-c:a", "libvorbis", "-q:a", "6"))
+        codec = Codec(("-c:a", "libvorbis", "-q:a", "6"), downmix=unsupported, sides_as_back=True)
     else:  # .opus, and .ogg when the source is Opus or ffmpeg lacks Vorbis
-        downmix = source.layout not in OPUS_LAYOUTS and source.layout not in SIDES_AS_BACK
-        bitrate = 96 * (2 if downmix else source.channels)
-        codec = Codec(("-c:a", "libopus", "-b:a", f"{bitrate}k"), opus=True, downmix=downmix,
-                      sides_as_back=True)
+        # ffmpeg puts 5 and 7 channels in the wrong speakers in Opus files. So they
+        # get a silent LFE channel (5.1), or their back centre one split in two (7.1).
+        upmix = "" if unsupported else {5: "5.1", 7: "7.1"}.get(source.channels, "")
+        bitrate = 96 * (2 if unsupported else source.channels)  # (what's added costs little)
+        codec = Codec(("-c:a", "libopus", "-b:a", f"{bitrate}k"), opus=True,
+                      downmix=unsupported, sides_as_back=True, upmix=upmix)
     if codec.args[1] not in encoders:
         raise NightcoreError(f"this ffmpeg can't write {ext[1:]} files "
                              f"(it has no {codec.args[1]} encoder); choose another format with -f")
@@ -648,21 +684,30 @@ def _atempo(factor: float) -> list[str]:
     return [f"atempo={step:.8f}" for step in steps]
 
 
-def audio_filters(source: Source, effect: Effect, engine: str, codec: Codec, ffmpeg: str) -> list[str]:
-    """The ffmpeg filter chain that applies the effect and prepares the output."""
+def audio_filters(source: Source, effect: Effect, engine: str, codec: Codec, ffmpeg: str,
+                  gain: float = 1) -> list[str]:
+    """The ffmpeg filter chain that applies the effect and prepares the output.
+
+    `gain` is how much the audio was amplified before (for Rubber Band), to undo.
+    """
     soxr = _has_soxr(ffmpeg)
     rate = _output_rate(source.sample_rate, codec)
     ratio = 2 ** (effect.pitch / 12)  # the pitch change as a frequency ratio
-    chain = ["aformat=sample_fmts=fltp"]  # process in floating point: no clipping along the way
+    chain = []
     if engine == "rubberband" and source.layout:
         # The Rubber Band program worked on a WAV file, which lost the channel layout.
-        chain.insert(0, f"channelmap=channel_layout={source.layout}")
+        chain.append(f"channelmap=channel_layout={source.layout}")
+    # Start at the first sample, also where the audio starts late in its file (in
+    # a video, say), and process in floating point: no clipping along the way.
+    chain += ["asetpts=PTS-STARTPTS", "aformat=sample_fmts=fltp"]
     if codec.downmix:
         # Normalized, as ffmpeg's own downmix of floating-point audio can go far
         # over full scale, and first, so the limiter sees what is written.
         chain += ["aresample=rematrix_maxval=1", "aformat=channel_layouts=stereo"]
     elif codec.sides_as_back and source.layout in SIDES_AS_BACK:
         chain.append(f"channelmap=channel_layout={SIDES_AS_BACK[source.layout]}")
+    if codec.upmix:
+        chain.append(f"aformat=channel_layouts={codec.upmix}")
 
     # asetrate sets a rate, not a ratio: a later part of the file at another
     # sample rate (joined MP3s, say) must be converted to the first one's.
@@ -682,8 +727,8 @@ def audio_filters(source: Source, effect: Effect, engine: str, codec: Codec, ffm
         if engine == "ffmpeg-rubberband":
             chain.append(f"rubberband=tempo={effect.tempo:.8f}:pitch={ratio:.8f}"
                          ":pitchq=quality:channels=together")  # together: keeps the stereo image
-        else:
-            chain.append("volume=4")  # it was given 12 dB of headroom
+        elif gain != 1:
+            chain.append(f"volume={1 / gain:.8g}")
         if rate != source.sample_rate:
             chain.append(_resample(rate, soxr, source.sample_rate))
     if effect.bass:
@@ -717,17 +762,37 @@ def _decode(source: Source, output: Path, tools: Tools, verbose: bool,
             progress: Callable[[float], None] | None, volume: float = 1) -> Path:
     """Decode the audio to a floating-point WAV file."""
     _run([tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-          "-i", source.path, "-map", "0:a:0", "-map_metadata", "-1", "-af", f"volume={volume:g}",
+          "-i", source.path, "-map", "0:a:0", "-map_metadata", "-1", "-af", f"volume={volume:.8g}",
           "-c:a", "pcm_f32le", "-rf64", "auto", output],
          verbose=verbose, duration=source.duration, progress=progress)
     return output
 
 
+def _peak(source: Source, tools: Tools, verbose: bool,
+          progress: Callable[[float], None] | None) -> float:
+    """The audio's highest sample value (1, full scale, if ffmpeg doesn't say)."""
+    messages = _run([tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "info", "-i", source.path,
+                     "-map", "0:a:0", "-af", "astats=measure_perchannel=none:measure_overall=Peak_level",
+                     "-f", "null", "-"],
+                    verbose=verbose, duration=source.duration, progress=progress)
+    levels = re.findall(rb"Peak level dB: (-inf|-?\d+(?:\.\d+)?)\s*$", b"".join(messages), re.M)
+    return 10 ** (float(levels[-1]) / 20) if levels else 1.0
+
+
 def _stretch_with_rubberband(source: Source, effect: Effect, rubberband: str, workdir: Path,
-                             tools: Tools, verbose: bool, steps: _Progress) -> Path:
-    """Time-stretch with the Rubber Band program, which only reads WAV files."""
-    # 12 dB of headroom: time-stretched audio peaks higher than the source.
-    decoded = _decode(source, workdir / "decoded.wav", tools, verbose, steps.stage(0.05), 0.25)
+                             tools: Tools, verbose: bool, steps: _Progress) -> tuple[Path, float]:
+    """Time-stretch with the Rubber Band program, on a decoded copy: it can't
+    read most formats, and the copy gets the headroom it needs.
+
+    Returns the file, and the gain it was given, which the caller undoes.
+    """
+    # Its output can't go over full scale, and time-stretched audio peaks up to
+    # 10 dB higher than the source (square waves do). So the peaks go to -12 dBFS.
+    # Quiet audio is raised to that too: Rubber Band's R3 engine handles audio
+    # below about -57 dBFS as silence, and puts it out at the wrong pitch.
+    peak = _peak(source, tools, verbose, steps.stage(0.02))
+    gain = 0.25 / max(peak, 0.00025)
+    decoded = _decode(source, workdir / "decoded.wav", tools, verbose, steps.stage(0.05), gain)
     stretched = workdir / "stretched.wav"
     # File names relative to the work folder: on Windows, Rubber Band can only
     # open paths that fit the system code page, and the temp folder may not.
@@ -738,7 +803,7 @@ def _stretch_with_rubberband(source: Source, effect: Effect, rubberband: str, wo
     # It reports success even when it couldn't write it all (a full disk).
     if _duration(stretched, tools) < 0.99 * _duration(decoded, tools) / effect.tempo:
         raise NightcoreError(f"Rubber Band stopped early (is the temp folder {workdir.parent} full?)")
-    return stretched
+    return stretched, gain
 
 
 class _Progress:
@@ -779,19 +844,22 @@ def render(source: Source, output: Path, effect: Effect, engine: str, tools: Too
     partial.unlink()  # let ffmpeg create it, with normal permissions
     try:
         with _work_folder(prefix="nightcore-") as workdir:
-            audio = source.path
+            audio, gain = source.path, 1.0
             if engine == "rubberband":
-                audio = _stretch_with_rubberband(source, effect, rubberband, workdir,
-                                                 tools, verbose, steps)
+                audio, gain = _stretch_with_rubberband(source, effect, rubberband, workdir,
+                                                       tools, verbose, steps)
             elif ext == ".mp3" and source.replaygain:
                 # ffmpeg passes the source's ReplayGain on to the MP3 encoder, which
                 # writes it (now wrong) into the file's header. A decoded copy has none.
                 audio = _decode(source, workdir / "decoded.wav", tools, verbose,
                                 steps.stage(0.1))
             tags = workdir / "tags.txt"
-            tag_file, tag_arguments = _ffmetadata(output_tags(source, effect, ext))
+            # Chapters move to the new tempo, like the timestamps of synced lyrics.
+            chapters = [(start / effect.tempo, end / effect.tempo, title)
+                        for start, end, title in source.chapters if ext in CHAPTER_FORMATS]
+            tag_file, tag_arguments = _ffmetadata(output_tags(source, effect, ext), chapters)
             tags.write_bytes(tag_file)
-            filters = audio_filters(source, effect, engine, codec, tools.ffmpeg)
+            filters = audio_filters(source, effect, engine, codec, tools.ffmpeg, gain)
             duration = source.duration / effect.tempo
             encoding = steps.stage(1 - steps.done)
             cover = source.cover if ext in COVER_ART_FORMATS else None
@@ -819,7 +887,7 @@ def render(source: Source, output: Path, effect: Effect, engine: str, tools: Too
 
 
 def _publish(partial: Path, output: Path, overwrite: bool) -> None:
-    """Move the finished file into place, or copy it there by a hard link.
+    """Move the finished file into place, or hard-link it there.
 
     A link can't replace a file, so without `overwrite`, a file that another
     run made in the meantime is left alone. (The caller removes `partial`.)
@@ -852,8 +920,7 @@ def _encode_command(source: Source, audio: Path, tags: Path, tag_arguments: list
         cmd += ["-map", f"{original}:{cover}", "-c:v", "copy", "-disposition:v:0", "attached_pic"]
         if not source.cover_type:
             cmd += ["-metadata:s:v:0", "comment=Cover (front)"]
-    # Chapters would point at the wrong times after a tempo change.
-    cmd += ["-map_metadata", str(original + 1), *tag_arguments, "-map_chapters", "-1",
+    cmd += ["-map_metadata", str(original + 1), *tag_arguments, "-map_chapters", str(original + 1),
             *codec.args, str(output)]
     return cmd
 
@@ -881,10 +948,21 @@ def _default_extension(source: Source, fmt: str | None) -> str:
 
 def default_output(source: Source, directory: Path, fmt: str | None, effect: Effect) -> Path:
     """'<name> (Nightcore).<ext>', keeping the source's format when possible."""
-    stem, suffix = source.path.stem, f" ({effect.label}){_default_extension(source, fmt)}"
-    while len(os.fsencode(stem + suffix)) > 255 and len(stem) > 1:
-        stem = stem[:-1]  # file names can't be longer than 255 bytes
-    return directory / (stem.rstrip() + suffix)
+    return directory / _output_name(source.path.stem,
+                                    f" ({effect.label}){_default_extension(source, fmt)}")
+
+
+def _output_name(stem: str, suffix: str) -> str:
+    """`stem` + `suffix`, with the stem shortened to fit the longest file name there can be."""
+    while _name_length(stem + suffix) > 255 and len(stem) > 1:
+        stem = stem[:-1]
+    return stem.rstrip() + suffix
+
+
+def _name_length(name: str, windows: bool = os.name == "nt") -> int:
+    """A file name's length as the file system counts it: UTF-16 units on
+    Windows, bytes elsewhere."""
+    return len(name.encode("utf-16-le", "surrogatepass")) // 2 if windows else len(os.fsencode(name))
 
 
 def plan_output(source: Source, output: Path | None, fmt: str | None, effect: Effect,
@@ -976,19 +1054,19 @@ def nightcore(source: str | os.PathLike, output: str | os.PathLike | None = None
 LABELS = (" (Nightcore)", " (Slowed)")
 
 
-def _is_generated(path: Path) -> bool:
-    return path.stem.endswith(LABELS)
-
-
 def _skip_earlier_results(files: list[Path]) -> tuple[list[Path], list[Path]]:
     """Leave out earlier results that are given along with their originals
     (as when running `*.mp3` again). Returns (files to do, files left out)."""
-    def key(path: Path, stem: str) -> str:
-        return os.path.normcase(os.path.abspath(path.with_name(stem)))
-    stems = {key(path, path.stem) for path in files}
-    skipped = [path for path in files if _is_generated(path) and
-               key(path, next(path.stem[:-len(label)] for label in LABELS
-                              if path.stem.endswith(label))) in stems]
+    def key(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(path))
+    # The names the inputs' results would have (as default_output makes them),
+    # and which inputs they would be made from.
+    extensions = {path.suffix for path in files if path.stem.endswith(LABELS)}
+    results = collections.defaultdict(set)
+    for path in files:
+        for suffix in (label + ext for label in LABELS for ext in extensions):
+            results[key(path.parent / _output_name(path.stem, suffix))].add(key(path))
+    skipped = [path for path in files if results[key(path)] - {key(path)}]
     return [path for path in files if path not in skipped], skipped
 
 
@@ -1000,20 +1078,22 @@ def _file_id(path: Path) -> tuple | None:
     return info.st_dev, info.st_ino
 
 
-def expand_inputs(names: Iterable[str]) -> tuple[list[Path], list[str]]:
-    """Files to process (folders are scanned for audio), plus any errors."""
-    files, errors = [], []
+def expand_inputs(names: Iterable[str]) -> tuple[list[Path], list[str], list[Path]]:
+    """Files to process (folders are scanned for audio), any errors, and the
+    files in the folders that are named like results, which are left out."""
+    files, errors, results = [], [], []
     for name in names:
         path = Path(name)
         try:
             if path.is_dir():
                 found = [p for p in sorted(path.iterdir())
                          if p.is_file() and p.suffix.lower() in INPUT_EXTENSIONS
-                         and not p.name.startswith(".") and not _is_generated(p)]
+                         and not p.name.startswith(".")]
                 if not found:
                     errors.append(f"{name}: no audio files in this folder "
                                   "(subfolders are not searched)")
-                files += found
+                files += [p for p in found if not p.stem.endswith(LABELS)]
+                results += [p for p in found if p.stem.endswith(LABELS)]
             elif path.is_file():
                 files.append(path)
             elif "*" in name or "?" in name:
@@ -1028,7 +1108,7 @@ def expand_inputs(names: Iterable[str]) -> tuple[list[Path], list[str]]:
                 errors.append(f"{name}: no such file or folder")
         except OSError as error:
             errors.append(f"{name}: {_describe(error)}")
-    return files, errors
+    return files, errors, results
 
 
 def _number_in(bounds: tuple) -> Callable[[str], float]:
@@ -1080,8 +1160,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="input file (same as giving it without -s)")
     parser.add_argument("-o", "--output", metavar="PATH",
                         help="output file or folder; it is a folder if it exists as one, ends "
-                             "in '/', or there are several inputs (default: '<name> "
-                             "(Nightcore).<ext>' next to each input)")
+                             "in '/', or there are several inputs or a folder input (default: "
+                             "'<name> (Nightcore).<ext>' next to each input)")
     parser.add_argument("-f", "--format", type=_format, metavar="FORMAT",
                         help=f"output format: {', '.join(FORMATS)} "
                              "(default: the input's format where possible)")
@@ -1173,33 +1253,41 @@ class _Status:
             self.shown = line
 
 
-def _say(text: str, end: str = "\n") -> None:
-    """Print a progress message. A closed pipe (e.g. `| head`) doesn't stop the work."""
+def _say(text: str, end: str = "\n", stream=None) -> None:
+    """Print a message. A closed pipe (`| head`) or terminal doesn't stop the work."""
+    stream = stream or sys.stdout
     try:
-        print(text, end=end, flush=True)
-    except BrokenPipeError:
-        with contextlib.suppress(OSError, ValueError):
-            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
-
-
-def _stop(signum, frame):
-    raise KeyboardInterrupt
+        print(text, end=end, file=stream, flush=True)
+    except (OSError, ValueError):
+        with contextlib.suppress(OSError, ValueError, AttributeError):  # no more output there
+            os.dup2(os.open(os.devnull, os.O_WRONLY), stream.fileno())
 
 
 @contextlib.contextmanager
 def _stoppable():
-    """Clean up on termination signals like on Ctrl+C: on macOS and Linux, closing
-    the terminal and kill. (On Windows, closing the console can't be caught.)"""
+    """Clean up on termination signals as on Ctrl+C: on macOS and Linux, closing the
+    terminal and kill. (On Windows, closing the console can't be caught.) Only the
+    first one interrupts, so a second Ctrl+C can't cut the cleanup short."""
+    stopping = False
+
+    def stop(signum, frame):
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise KeyboardInterrupt
+
     previous = {}
-    for name in ("SIGTERM", "SIGHUP", "SIGBREAK"):
-        if hasattr(signal, name):
+    for name in ("SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        # A signal set to be ignored (as by nohup) stays ignored, for ffmpeg too.
+        if sig is not None and signal.getsignal(sig) is not signal.SIG_IGN:
             with contextlib.suppress(ValueError, OSError):  # not in the main thread
-                previous[name] = signal.signal(getattr(signal, name), _stop)
+                previous[sig] = signal.signal(sig, stop)
     try:
         yield
     finally:
-        for name, handler in previous.items():
-            signal.signal(getattr(signal, name), handler)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def _describe(error: Exception) -> str:
@@ -1218,6 +1306,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     names = list(args.inputs) + list(args.source)
+    if os.name == "nt":  # "C:\My Music\" arrives as 'C:\My Music"': its \" is a quote there
+        names = [name[:-1] + "\\" if name.endswith('"') else name for name in names]
+        if args.output and args.output.endswith('"'):
+            args.output = args.output[:-1] + "\\"
     if not names:
         parser.error("no input files given")
     stretch = args.tempo is not None or args.pitch is not None
@@ -1228,25 +1320,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     effect = make_effect(args.speed, args.tempo, args.pitch, args.bass)
 
     def fail(message: str) -> None:
-        print(f"error: {message}", file=sys.stderr, flush=True)
+        _say(f"error: {message}", stream=sys.stderr)
 
-    files, errors = expand_inputs(names)
+    status = _Status(args.quiet, args.verbose)
+    files, errors, results = expand_inputs(names)
     for message in errors:
         fail(message)
-    files, skipped = _skip_earlier_results(files)
+    # A batch: several inputs (as given, so also when earlier results are left
+    # out) or a folder. -o is then a folder, and existing results are skipped.
+    batch = len(names) > 1 or len(files) > 1 or any(map(os.path.isdir, names))
+    files, earlier = _skip_earlier_results(files + results)
+    # In a folder, also those without their original (moved away, say). A
+    # download that is named so can still be given by name.
+    unmatched = [path for path in results if path not in earlier]
+    files = [path for path in files if path not in unmatched]
+    for path in earlier:
+        status.info(f"skipping {path.name}: an earlier result")
+    for path in unmatched:
+        status.info(f"skipping {path.name}: named like a result (give it by name to make it)")
     if not files:
-        return 1 if errors or not skipped else 0
+        return 1 if errors else 0
 
-    # The output is a file, or a folder: a named one, or when there are several inputs.
+    # The output is a file, or a folder: a named one, or for a batch.
     output, folder = None, False
     if args.output:
         output = Path(os.path.abspath(args.output))
         named_folder = _is_folder(args.output)
-        folder = named_folder or len(files) > 1 or any(map(os.path.isdir, names))
+        folder = named_folder or batch
         is_file = os.path.isfile(output)
         if folder and not named_folder and _extension(output)[1:] in FORMATS:
-            parser.error(f"--output {args.output} looks like a file, but there are several "
-                         "inputs; give a folder (ending in '/')")
+            parser.error(f"--output {args.output} looks like a file, but it must be a folder "
+                         "for several inputs or a folder input; give a folder (ending in '/')")
         if folder and is_file:
             parser.error(f"--output {args.output} is a file, not a folder")
         if not folder:
@@ -1262,18 +1366,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         fail(str(error))
         return 1
 
-    status = _Status(args.quiet, args.verbose)
     how = {"resample": "resampled", "rubberband": "time-stretched with Rubber Band",
            "ffmpeg-rubberband": "time-stretched with ffmpeg's rubberband filter",
            "atempo": "time-stretched with ffmpeg's atempo"}[engine]
     status.info(f"{effect.label}: {effect.describe()}, {how}")
     if engine == "atempo" and args.engine == "auto":
-        print("warning: Rubber Band was not found, so the lower-quality atempo filter is used. "
-              "To install Rubber Band:\n" + RUBBERBAND_INSTALL, file=sys.stderr)
-    for path in skipped:
-        status.info(f"skipping {path.name}: an earlier result")
+        _say("warning: Rubber Band was not found, so the lower-quality atempo filter is used. "
+             "To install Rubber Band:\n" + RUBBERBAND_INSTALL, stream=sys.stderr)
 
-    done, failed = 0, len(errors)
+    done, failed, skipped = 0, len(errors), len(earlier) + len(unmatched)
     planned, written = set(), set()
     inputs = {_file_id(path) for path in files} - {None}
     with _stoppable():
@@ -1289,10 +1390,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         raise NightcoreError(f"{target.name} would be written twice "
                                              "(two inputs have the same name)")
                     planned.add(key)
-                    _check_target(source_path, target, args.overwrite)
-                    if target_id in inputs:
+                    if target_id in inputs and not _same_file(target, source_path):
                         raise NightcoreError(f"{target.name} is one of the inputs, "
                                              "so it won't be overwritten")
+                    if (batch and not args.overwrite and os.path.isfile(target)
+                            and not _same_file(target, source_path)):  # (made by an earlier run)
+                        status.info(f"{prefix}skipping {path.name}: {target.name} already exists "
+                                    "(use -y to overwrite)")
+                        skipped += 1
+                        continue
+                    _check_target(source_path, target, args.overwrite)
                     status.start(f"{prefix}{path.name} -> {target.name}")
                     try:
                         notes = render(source, target, effect, engine, tools,
@@ -1305,17 +1412,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     status.finish(True)
                     written.add(_file_id(target))
                     for note in notes:
-                        print(f"warning: {path.name}: {note}", file=sys.stderr)
+                        _say(f"warning: {path.name}: {note}", stream=sys.stderr)
                     done += 1
                 except (NightcoreError, OSError) as error:
                     fail(f"{path.name}: {_describe(error)}")
                     failed += 1
         except KeyboardInterrupt:
-            print("\ninterrupted", file=sys.stderr)
+            _say("\ninterrupted", stream=sys.stderr)
             return 130
 
     if len(files) > 1 or errors:
-        status.info(f"{done} done, {failed} failed")
+        status.info(f"{done} done, " + (f"{skipped} skipped, " if skipped else "") + f"{failed} failed")
     return 1 if failed else 0
 
 

@@ -6,9 +6,11 @@ with its tags and cover art. Those tests are skipped when ffmpeg is missing.
 """
 
 import array
+import contextlib
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import stat
@@ -22,9 +24,12 @@ import pytest
 
 import MakeNightcore as mn
 
-FFMPEG = shutil.which("ffmpeg")
-needs_ffmpeg = pytest.mark.skipif(not (FFMPEG and shutil.which("ffprobe")),
-                                  reason="ffmpeg is not installed")
+try:
+    TOOLS = mn.Tools.find()  # the ffmpeg the tool uses (on macOS, maybe not the one on PATH)
+except mn.NightcoreError:
+    TOOLS = None
+FFMPEG = TOOLS and TOOLS.ffmpeg
+needs_ffmpeg = pytest.mark.skipif(TOOLS is None, reason="ffmpeg is not installed")
 posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX only")
 
 
@@ -33,12 +38,12 @@ posix_only = pytest.mark.skipif(os.name == "nt", reason="POSIX only")
 # --------------------------------------------------------------------------
 
 def ffmpeg(*args):
-    subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+    subprocess.run([FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                     *map(str, args)], check=True)
 
 
 def ffprobe(path, *what):
-    result = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json",
+    result = subprocess.run([TOOLS.ffprobe, "-v", "error", "-print_format", "json",
                              *(what or ("-show_format", "-show_streams")), str(path)],
                             capture_output=True, check=True)
     return json.loads(result.stdout)
@@ -98,10 +103,20 @@ def make_tone(path, freq=440, seconds=2.0, rate=44100, tags=None, cover=None,
     return Path(path)
 
 
+def without_layout(path):
+    """Clear a WAV file's channel mask, which names its layout, as in many files."""
+    data = bytearray(path.read_bytes())
+    header = data.index(b"fmt ") + 8
+    if data[header: header + 2] == b"\xfe\xff":  # WAVE_FORMAT_EXTENSIBLE, which has one
+        data[header + 20: header + 24] = bytes(4)
+        path.write_bytes(data)
+    return path
+
+
 def samples(path):
     """(rate, channels, float samples) of the first audio stream."""
     stream = audio_stream(path)
-    raw = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path),
+    raw = subprocess.run([FFMPEG, "-nostdin", "-loglevel", "error", "-i", str(path),
                           "-map", "0:a:0", "-f", "f32le", "-c:a", "pcm_f32le", "-"],
                          capture_output=True, check=True).stdout
     values = array.array("f")
@@ -212,6 +227,11 @@ def test_output_tags_are_updated_for_the_new_version():
     })
     tags = mn.output_tags(source, mn.Effect.classic(1.25), ".mp3")
     assert tags == {"TITLE": "Song (Nightcore)", "artist": "Band", "album": "Album", "TBPM": "150"}
+    identifiers = {"MUSICBRAINZ_TRACKID": "abc", "MusicBrainz Track Id": "abc", "ACOUSTID_ID": "x",
+                   "Acoustid Fingerprint": "AQAD", "ISRC": "US1", "TSRC": "US1", "MP3GAIN_UNDO": "1",
+                   "MUSICBRAINZ_ALBUMID": "kept: it names the album"}
+    tags = mn.output_tags(make_source(tags=identifiers), mn.Effect.classic(), ".mp3")
+    assert set(tags) == {"MUSICBRAINZ_ALBUMID", "title"}
 
 
 @pytest.mark.parametrize("ext, key", [(".mp3", "TBPM"), (".m4a", "tmpo"), (".flac", "BPM"),
@@ -267,6 +287,67 @@ def test_ffmetadata_escaping():
 def test_default_output_name(name, codec, lossless, fmt, expected):
     source = make_source(name, codec, lossless)
     assert mn.default_output(source, Path("out"), fmt, mn.Effect.classic()) == Path("out", expected)
+
+
+def test_name_length_is_counted_as_the_file_system_does():
+    name = "夜" * 100 + " (Nightcore).opus"
+    assert mn._name_length(name, windows=False) == 317  # UTF-8 bytes
+    assert mn._name_length(name, windows=True) == 117  # NTFS: UTF-16 units
+    assert mn._name_length("a\udc80", windows=True) == 2  # Windows allows lone surrogates
+
+
+def test_skipping_earlier_results():
+    long = "夜" * 200
+    shortened = Path("m", mn._output_name(long, " (Nightcore).mp3"))  # its result
+    at_limit = Path("m", "x" * 239 + " (Nightcore).mp3")  # 255 characters: its result is itself
+    files = [Path("m/song.flac"), Path("m/song (Nightcore).mp3"), Path("m/song (Slowed).wav"),
+             Path("m/Other (Slowed).mp3"), Path("m/ .mp3"), Path("m/ (Nightcore).mp3"),
+             Path("x/song (Nightcore).mp3"), Path(f"m/{long}.mp3"), shortened, at_limit]
+    todo, earlier = mn._skip_earlier_results(files)
+    assert earlier == [Path("m/song (Nightcore).mp3"), Path("m/song (Slowed).wav"),
+                       Path("m/ (Nightcore).mp3"), shortened]
+    assert todo == [Path("m/song.flac"), Path("m/Other (Slowed).mp3"), Path("m/ .mp3"),
+                    Path("x/song (Nightcore).mp3"), Path(f"m/{long}.mp3"), at_limit]
+
+
+def test_dts_hd_master_audio_is_lossless(monkeypatch):
+    info = {"format": {"duration": "10"}, "streams": [{
+        "codec_type": "audio", "codec_name": "dts", "profile": "DTS-HD MA", "sample_rate": "48000",
+        "channels": 8, "channel_layout": "7.1", "sample_fmt": "s32p", "bits_per_raw_sample": "24"}]}
+    monkeypatch.setattr(mn, "_capture", lambda cmd: subprocess.CompletedProcess(
+        cmd, 0, json.dumps(info).encode(), b""))
+    source = mn.probe(Path("movie.mkv"), mn.Tools("ffmpeg", "ffprobe"))
+    assert source.lossless and source.bits == 24
+    assert mn.default_output(source, Path("."), None, mn.Effect.classic()).suffix == ".flac"
+
+
+@posix_only
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM], ids=["SIGINT", "SIGTERM"])
+def test_only_the_first_signal_interrupts(sig):
+    cleaned_up = False
+    with pytest.raises(KeyboardInterrupt):
+        with mn._stoppable():
+            try:
+                os.kill(os.getpid(), sig)
+                time.sleep(1)
+            except KeyboardInterrupt:
+                os.kill(os.getpid(), sig)  # a second one (Ctrl+C again), during the cleanup
+                time.sleep(0.2)
+                cleaned_up = True
+                raise
+    assert cleaned_up
+
+
+@posix_only
+def test_ignored_signals_stay_ignored():
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)  # as nohup does
+    try:
+        with mn._stoppable():
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(0.2)
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGHUP, previous)
 
 
 def test_long_names_are_shortened_to_fit():
@@ -375,6 +456,7 @@ def test_help_is_wrapped(monkeypatch, capsys):
 def test_missing_ffmpeg_is_explained(tmp_path, monkeypatch, capsys):
     (tmp_path / "a.mp3").write_bytes(b"")
     monkeypatch.setattr(mn, "find_program", lambda *names: None)
+    monkeypatch.setattr(mn, "FFMPEG_FULL_DIRS", ())
     assert run(tmp_path / "a.mp3") == 1
     assert "ffmpeg was not found" in capsys.readouterr().err
 
@@ -387,8 +469,8 @@ def test_missing_input_is_reported(tmp_path, capsys):
 def test_wildcards_are_expanded(tmp_path):
     for name in ("b.mp3", "a.mp3", "c.wav", "[x].mp3"):
         (tmp_path / name).write_bytes(b"")
-    files, errors = mn.expand_inputs([str(tmp_path / "*.mp3"), str(tmp_path / "*.ogg"),
-                                      str(tmp_path / "[x].mp3")])
+    files, errors, _ = mn.expand_inputs([str(tmp_path / "*.mp3"), str(tmp_path / "*.ogg"),
+                                         str(tmp_path / "[x].mp3")])
     assert [f.name for f in files] == ["[x].mp3", "a.mp3", "b.mp3", "[x].mp3"]
     assert errors == [f"{tmp_path / '*.ogg'}: no files match"]
 
@@ -398,7 +480,7 @@ def test_wildcards_in_folders_with_brackets(tmp_path):
     folder.mkdir()
     for name in ("a.wav", "Song [Remix].wav"):
         (folder / name).write_bytes(b"")
-    files, errors = mn.expand_inputs([str(folder / "*.wav")])
+    files, errors, _ = mn.expand_inputs([str(folder / "*.wav")])
     assert [f.name for f in files] == ["Song [Remix].wav", "a.wav"] and errors == []
 
 
@@ -412,14 +494,14 @@ def test_unreadable_folder_is_reported(tmp_path, monkeypatch):
             raise PermissionError(1, "Operation not permitted", str(self))
         return real_iterdir(self)
     monkeypatch.setattr(Path, "iterdir", iterdir)
-    files, errors = mn.expand_inputs([str(tmp_path / "locked"), str(tmp_path / "song.mp3")])
+    files, errors, _ = mn.expand_inputs([str(tmp_path / "locked"), str(tmp_path / "song.mp3")])
     assert [f.name for f in files] == ["song.mp3"]
     assert errors == [f"{tmp_path / 'locked'}: Operation not permitted: {tmp_path / 'locked'}"]
 
 
 def test_empty_folder_explains_subfolders(tmp_path):
     (tmp_path / "Artist" / "Album").mkdir(parents=True)
-    files, errors = mn.expand_inputs([str(tmp_path)])
+    files, errors, _ = mn.expand_inputs([str(tmp_path)])
     assert files == [] and "subfolders are not searched" in errors[0]
 
 
@@ -464,6 +546,23 @@ def test_programs_are_found_by_absolute_path(tmp_path, monkeypatch):
 
 
 @posix_only
+def test_ffprobe_is_found_next_to_a_linked_ffmpeg(tmp_path, monkeypatch):
+    real = tmp_path / "opt" / "ffmpeg" / "bin"
+    fake_program(real / "ffmpeg")
+    fake_program(real / "ffprobe")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "ffmpeg").symlink_to(real / "ffmpeg")  # only ffmpeg is linked onto PATH
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    monkeypatch.setattr(mn.sys, "platform", "linux")
+    assert mn.Tools.find() == mn.Tools(str(tmp_path / "bin" / "ffmpeg"), str(real / "ffprobe"))
+
+
+def test_homebrews_programs_are_found_on_macos_without_path(monkeypatch):
+    monkeypatch.setattr(mn.sys, "platform", "darwin")  # (Finder and launchd leave it out)
+    assert {Path("/opt/homebrew/bin"), Path("/usr/local/bin")} <= set(mn._search_dirs())
+
+
+@posix_only
 def test_ffmpeg_unzipped_next_to_the_script_is_found(tmp_path, monkeypatch):
     # "Extract All" puts gyan.dev's build in a folder named after the zip.
     ffmpeg = fake_program(tmp_path / "ffmpeg-release-essentials" / "ffmpeg-9.0-essentials_build"
@@ -486,6 +585,25 @@ def test_unpacking_reports_a_folder_it_could_not_move(tmp_path, monkeypatch):
     assert listing(tmp_path / "cache") == []  # nothing half done is left
 
 
+def test_a_bundled_rubberband_that_cant_be_unpacked_says_why(tmp_path, monkeypatch):
+    class Windows:  # the os module, as it looks there
+        name = "nt"
+
+        def __getattr__(self, attribute):
+            return getattr(os, attribute)
+
+    def locked(archive, destination):
+        raise PermissionError(13, "Access is denied", str(destination))
+    (tmp_path / "bundle.zip").write_bytes(b"")
+    monkeypatch.setattr(mn, "os", Windows())
+    monkeypatch.setattr(mn, "find_program", lambda *names, near=None: None)
+    monkeypatch.setattr(mn, "BUNDLED_RUBBERBAND_ZIP", tmp_path / "bundle.zip")
+    monkeypatch.setattr(mn, "_unpack", locked)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    with pytest.raises(mn.NightcoreError, match="could not be unpacked.*Access is denied"):
+        mn.find_rubberband()
+
+
 @posix_only
 def test_homebrews_complete_ffmpeg_comes_first_on_macos(tmp_path, monkeypatch):
     for name in ("ffmpeg", "ffprobe"):
@@ -499,10 +617,9 @@ def test_homebrews_complete_ffmpeg_comes_first_on_macos(tmp_path, monkeypatch):
 @needs_ffmpeg
 @pytest.mark.parametrize("layout, name", [("FC+LFE", "FC+LFE"), ("5.1(side)", "5.1(side)")])
 def test_channel_layouts_without_a_name_are_kept_too(tmp_path, layout, name):
-    source = tmp_path / "odd.wav"
+    source = tmp_path / "odd.flac"  # (ffprobe 5.1 doesn't see these layouts in WAV files)
     ffmpeg("-f", "lavfi", "-i", "sine=duration=1", "-af", f"pan={layout}|" + "|".join(
-        f"c{i}=c0" for i in range(len(layout.split("+")) if "+" in layout else 6)),
-           "-c:a", "pcm_s16le", source)
+        f"c{i}=c0" for i in range(len(layout.split("+")) if "+" in layout else 6)), source)
     assert run(source, "--tempo", "1.2", "-f", "flac") == 0
     assert mn.probe(tmp_path / "odd (Nightcore).flac", mn.Tools.find()).layout == name
 
@@ -598,7 +715,7 @@ def test_time_stretching_keeps_the_level_without_clipping(tmp_path, engine, fmt)
 
 def side_to_mid_above_1k(path):
     """How loud the stereo difference is next to the sum, in dB, above 1 kHz."""
-    raw = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path), "-af",
+    raw = subprocess.run([FFMPEG, "-nostdin", "-loglevel", "error", "-i", str(path), "-af",
                           "highpass=f=1000,highpass=f=1000", "-f", "f32le", "-c:a", "pcm_f32le", "-"],
                          capture_output=True, check=True).stdout
     values = array.array("f")
@@ -710,9 +827,9 @@ def test_output_formats(tmp_path, fmt):
 
 
 @needs_ffmpeg
-@pytest.mark.parametrize("name, args", [("tone.flac", []), ("tone.opus", [])])
-def test_ogg_output_from_other_formats_is_vorbis(tmp_path, name, args):
-    source = make_tone(tmp_path / name, seconds=1, args=args)
+@pytest.mark.parametrize("name", ["tone.flac", "tone.opus"])
+def test_ogg_output_from_other_formats_is_vorbis(tmp_path, name):
+    source = make_tone(tmp_path / name, seconds=1)
     assert run(source, "-f", "ogg") == 0
     assert audio_stream(tmp_path / "tone (Nightcore).ogg")["codec_name"] == ogg_codec()
 
@@ -902,6 +1019,7 @@ def test_replaygain_in_an_mp3_header_is_not_carried_over(tmp_path):
     ffmpeg("-i", tagged, "-map_metadata", "-1", source)
     assert audio_stream(source).get("side_data_list") and not tags_of(source).get(
         "replaygain_track_gain")
+    assert mn.probe(source, mn.Tools.find()).replaygain  # so it takes the decoded-copy path
     assert run(source) == 0
     assert not audio_stream(tmp_path / "song (Nightcore).mp3").get("side_data_list")
 
@@ -916,8 +1034,12 @@ def test_tags_ending_in_a_backslash(tmp_path):
 
 
 @needs_ffmpeg
+@pytest.mark.parametrize("latency_option", [True, False])  # False: as before ffmpeg 5.1
 @pytest.mark.parametrize("args", [[], ["--bass", "3"]])
-def test_limiter_keeps_the_timing(tmp_path, args):
+def test_limiter_keeps_the_timing(tmp_path, monkeypatch, args, latency_option):
+    if not latency_option:
+        real = mn._filter_options
+        monkeypatch.setattr(mn, "_filter_options", lambda ffmpeg, name: real(ffmpeg, name) - {"latency"})
     source = tmp_path / "clicks.wav"
     ffmpeg("-f", "lavfi", "-i", "aevalsrc='if(eq(n\\,22050)+eq(n\\,44000)\\,0.5\\,0)':s=44100:d=1",
            "-c:a", "pcm_s16le", source)
@@ -928,16 +1050,21 @@ def test_limiter_keeps_the_timing(tmp_path, args):
 
 
 @needs_ffmpeg
-def test_chapters_are_dropped(tmp_path):
+@pytest.mark.parametrize("fmt", ["m4a", "mp3", "opus", "flac"])
+def test_chapters_are_moved_to_the_new_tempo(tmp_path, fmt):
     chapters = tmp_path / "chapters.txt"
     chapters.write_text(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle=One\n"
-                        "[CHAPTER]\nTIMEBASE=1/1000\nSTART=1000\nEND=2000\ntitle=Two\n")
+                        "[CHAPTER]\nTIMEBASE=1/1000\nSTART=1000\nEND=2000\ntitle=Two; #2\n")
     source = tmp_path / "book.m4a"
     ffmpeg("-f", "lavfi", "-i", "sine=duration=2", "-i", chapters, "-map", "0",
            "-map_chapters", "1", "-c:a", "aac", source)
-    assert ffprobe(source, "-show_chapters")["chapters"]
-    assert run(source) == 0
-    assert ffprobe(tmp_path / "book (Nightcore).m4a", "-show_chapters")["chapters"] == []
+    assert run(source, "-f", fmt) == 0
+    found = ffprobe(tmp_path / f"book (Nightcore).{fmt}", "-show_chapters")["chapters"]
+    if fmt in ("opus", "flac"):  # formats where ffmpeg gets chapters wrong or doesn't write them
+        assert found == []
+    else:
+        assert [(round(float(c["start_time"]), 2), round(float(c["end_time"]), 2),
+                 c["tags"]["title"]) for c in found] == [(0, 0.8, "One"), (0.8, 1.6, "Two; #2")]
 
 
 @needs_ffmpeg
@@ -1073,6 +1200,21 @@ def test_bass_boost_never_clips(tmp_path, fmt, args):
 
 
 @needs_ffmpeg
+@pytest.mark.parametrize("args, frequency", [(["--tempo", "1.25"], 1000), (["--pitch", "2"], 1122.46)])
+def test_quiet_audio_is_time_stretched_well(tmp_path, args, frequency):
+    needs_engine("rubberband")
+    source = tmp_path / "quiet.wav"  # a 1 kHz tone at -45 dBFS: a quiet recording, say
+    ffmpeg("-f", "lavfi", "-i", "sine=frequency=1000:duration=2,volume=-27dB", "-c:a", "pcm_s24le",
+           source)
+    assert run(source, *args, "--engine", "rubberband") == 0
+    _, measured, _, rms = analyse(tmp_path / "quiet (Nightcore).wav")
+    # Rubber Band's R3 engine takes audio this quiet (with any less gain) for
+    # silence, and gets its pitch 5% wrong and its level 9 dB too low.
+    assert measured == pytest.approx(frequency, rel=0.002)
+    assert db(rms / analyse(source)[3]) == pytest.approx(0, abs=1)  # (R2 loses 0.8 dB pitching)
+
+
+@needs_ffmpeg
 def test_bass_boost_boosts_the_bass_only(tmp_path):
     change = {}
     for freq in (60, 3000):
@@ -1126,12 +1268,31 @@ def test_level_is_untouched_without_bass_boost(tmp_path):
 # --------------------------------------------------------------------------
 
 @needs_ffmpeg
-def test_existing_output_needs_overwrite(tmp_path, capsys):
+def test_existing_output_is_kept_without_overwrite(tmp_path, capsys):
     source = make_tone(tmp_path / "tone.wav", seconds=1)
-    assert run(source) == 0
+    output = tmp_path / "tone (Nightcore).wav"
+    output.write_bytes(b"made before")
     assert run(source) == 1
-    assert "already exists (use -y to overwrite)" in capsys.readouterr().err
+    assert ("tone.wav: tone (Nightcore).wav already exists (use -y to overwrite)"
+            in capsys.readouterr().err)
+    assert output.read_bytes() == b"made before"
     assert run(source, "-y") == 0
+    assert analyse(output)[1] == pytest.approx(550, rel=0.005)
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("folder", [False, True])
+def test_a_batch_skips_songs_whose_result_exists(tmp_path, capsys, folder):
+    make_tone(tmp_path / "a.wav", seconds=1)
+    make_tone(tmp_path / "b.wav", seconds=1)
+    (tmp_path / "a (Nightcore).wav").write_bytes(b"made before")
+    inputs = [tmp_path] if folder else [tmp_path / "a.wav", tmp_path / "b.wav"]
+    assert run(*inputs) == 0  # only what's new is made
+    out = capsys.readouterr().out
+    assert "skipping a.wav: a (Nightcore).wav already exists (use -y to overwrite)" in out
+    assert "1 done, " in out and " skipped, 0 failed" in out
+    assert (tmp_path / "a (Nightcore).wav").read_bytes() == b"made before"
+    assert (tmp_path / "b (Nightcore).wav").exists()
 
 
 @needs_ffmpeg
@@ -1214,12 +1375,27 @@ def test_folder_input(tmp_path, capsys):
     music.mkdir()
     make_tone(music / "a.mp3", seconds=1)
     make_tone(music / "b.wav", seconds=1)
-    make_tone(music / "c (Nightcore).mp3", seconds=1)  # an earlier result: skipped
+    make_tone(music / "a (Nightcore).mp3", seconds=1)  # an earlier result of a.mp3
+    make_tone(music / "c (Slowed).mp3", seconds=1)  # one whose original was moved away
     make_tone(music / ".hidden.mp3", seconds=1)
     (music / "notes.txt").write_text("not audio")
     assert run(music, "-o", tmp_path / "out") == 0
     assert listing(tmp_path / "out") == ["a (Nightcore).mp3", "b (Nightcore).wav"]
-    assert "2 done, 0 failed" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "skipping a (Nightcore).mp3: an earlier result" in out
+    assert "skipping c (Slowed).mp3: named like a result (give it by name to make it)" in out
+    assert "2 done, 2 skipped, 0 failed" in out
+    assert run(music / "c (Slowed).mp3", "-o", tmp_path / "out") == 0  # a download, say
+    assert "c (Slowed) (Nightcore).mp3" in listing(tmp_path / "out")
+
+
+@needs_ffmpeg
+def test_folder_of_files_named_like_results(tmp_path, capsys):
+    make_tone(tmp_path / "Song (Nightcore).mp3", seconds=1)
+    assert run(tmp_path) == 0
+    captured = capsys.readouterr()
+    assert "skipping Song (Nightcore).mp3: named like a result" in captured.out
+    assert captured.err == "" and listing(tmp_path) == ["Song (Nightcore).mp3"]
 
 
 @needs_ffmpeg
@@ -1335,9 +1511,20 @@ def test_termination_cleans_up(tmp_path):
         time.sleep(0.01)
     proc.send_signal(signal.SIGTERM)
     assert proc.wait(timeout=30) == 130
-    time.sleep(0.5)  # anything still running would keep writing
     assert listing(tmp_path) == ["tmp", "tone.wav"]
     assert listing(work) == []
+    assert not running_with(str(source))  # ffmpeg was stopped too, not left writing
+
+
+def running_with(text):
+    """Whether any process has `text` in its command line."""
+    if Path("/proc/self/cmdline").exists():
+        for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+            with contextlib.suppress(OSError):
+                if text.encode() in cmdline.read_bytes():
+                    return True
+        return False
+    return subprocess.run(["pgrep", "-f", text], capture_output=True).returncode == 0
 
 
 @needs_ffmpeg
@@ -1393,15 +1580,23 @@ def test_a_chatty_ffmpeg_cannot_hang_it():
                  "-f", "null", "-", "-i", "missing"])
 
 
-def test_exit_codes_that_are_error_numbers_are_explained():
+@pytest.mark.parametrize("returncode", [256 - 28, 2 ** 32 - 28])  # (on Windows, the second)
+def test_exit_codes_that_are_error_numbers_are_explained(returncode):
     with pytest.raises(mn.NightcoreError, match=os.strerror(28)):
-        mn._failed(["ffmpeg"], 256 - 28, [])
+        mn._failed(["ffmpeg"], returncode, [])
+
+
+@pytest.mark.parametrize("returncode", [1, 255, 0xC0000005])  # 255: stopped by a signal
+def test_other_exit_codes_are_not_explained(returncode):
+    with pytest.raises(mn.NightcoreError, match=rf"exit code {returncode}$"):
+        mn._failed(["ffmpeg"], returncode, [])
 
 
 def test_ffprobe_missing_is_explained(tmp_path, monkeypatch, capsys):
     (tmp_path / "a.mp3").write_bytes(b"")
     monkeypatch.setattr(mn, "find_program", lambda *names, near=None:
                         "/usr/bin/ffmpeg" if names == ("ffmpeg",) else None)
+    monkeypatch.setattr(mn, "FFMPEG_FULL_DIRS", ())
     assert run(tmp_path / "a.mp3") == 1
     assert "ffprobe, which comes with ffmpeg, was not found" in capsys.readouterr().err
 
@@ -1413,6 +1608,8 @@ def test_no_home_folder_is_needed(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", no_home)
     monkeypatch.delenv("LOCALAPPDATA", raising=False)
     assert mn.Tools.find().ffmpeg
+    if os.name != "nt":
+        assert mn.find_program("no-such-program") is None
 
 
 @needs_ffmpeg
@@ -1431,11 +1628,24 @@ def test_file_names_that_are_not_utf8(tmp_path):
 @needs_ffmpeg
 def test_running_again_skips_earlier_results(tmp_path, capsys):
     make_tone(tmp_path / "song.wav", seconds=1)
+    make_tone(tmp_path / " .wav", seconds=1)  # whose result is " (Nightcore).wav"
     assert run(*sorted(tmp_path.iterdir())) == 0
     for args in ([], ["-y"]):  # like running `*.wav` again
-        assert run(*sorted(tmp_path.iterdir()), *args) == (1 if not args else 0)
-        assert "skipping song (Nightcore).wav: an earlier result" in capsys.readouterr().out
-    assert listing(tmp_path) == ["song (Nightcore).wav", "song.wav"]
+        assert run(*sorted(tmp_path.iterdir()), *args) == 0
+        out = capsys.readouterr().out
+        assert "skipping song (Nightcore).wav: an earlier result" in out
+        assert "skipping  (Nightcore).wav: an earlier result" in out
+    assert listing(tmp_path) == [" (Nightcore).wav", " .wav", "song (Nightcore).wav", "song.wav"]
+
+
+@needs_ffmpeg
+def test_running_again_with_one_song(tmp_path, capsys):
+    make_tone(tmp_path / "song.wav", seconds=1)
+    assert run(tmp_path / "song.wav") == 0
+    assert run(*sorted(tmp_path.iterdir())) == 0  # `*.wav` again: still several inputs
+    out = capsys.readouterr().out
+    assert "skipping song (Nightcore).wav: an earlier result" in out
+    assert "skipping song.wav: song (Nightcore).wav already exists" in out
 
 
 @needs_ffmpeg
@@ -1454,6 +1664,7 @@ def test_a_truncated_rubber_band_result_is_an_error(tmp_path, monkeypatch):
     def truncated(cmd, cwd, **kwargs):  # what Rubber Band leaves when the disk fills up
         ffmpeg("-i", Path(cwd, cmd[-2]), "-t", "0.5", "-c:a", "pcm_f32le", Path(cwd, cmd[-1]))
     monkeypatch.setattr(mn, "_run_rubberband", truncated)
+    monkeypatch.setattr(mn, "_rubberband_flags", lambda rubberband: ())  # (none is needed)
     tools = mn.Tools.find()
     source = mn.probe(make_tone(tmp_path / "tone.wav", seconds=2), tools)
     with pytest.raises(mn.NightcoreError, match="Rubber Band stopped early"):
@@ -1468,6 +1679,19 @@ def test_no_stdout(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "stdout", None)  # as under pythonw
     assert run(source) == 0
     assert (tmp_path / "tone (Nightcore).wav").is_file()
+
+
+@needs_ffmpeg
+@posix_only
+def test_closed_error_output_does_not_stop_the_work(tmp_path):
+    files = [make_tone(tmp_path / f"{name}.wav", seconds=1) for name in "ab"]
+    reader, writer = os.pipe()
+    os.close(reader)
+    result = subprocess.run([sys.executable, mn.__file__, str(tmp_path / "missing.mp3"),
+                             *map(str, files), "-v"], stdout=writer, stderr=writer)
+    os.close(writer)
+    assert result.returncode == 1  # for the missing file only
+    assert len([p for p in listing(tmp_path) if "(Nightcore)" in p]) == 2
 
 
 @needs_ffmpeg
@@ -1498,10 +1722,80 @@ def test_sample_rate_changes_within_a_file(tmp_path):
 
 
 @needs_ffmpeg
+@pytest.mark.parametrize("fmt", ["ogg", "opus"])
+def test_layouts_ogg_formats_cant_store_are_downmixed(tmp_path, fmt):
+    source = tmp_path / "4.0.flac"  # sound in the back centre channel only
+    ffmpeg("-f", "lavfi", "-i", "aevalsrc=0|0|0|0.5*sin(2*PI*440*t):c=4.0:d=1", source)
+    assert run(source, "-f", fmt) == 0
+    # Not stored as quad, with the back centre channel as the back left one.
+    output = tmp_path / f"4.0 (Nightcore).{fmt}"
+    assert audio_stream(output)["channels"] == 2
+    assert analyse(output)[3] > 0.05
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("fmt", ["ogg", "opus", "flac"])
+def test_unnamed_layouts_keep_their_channels(tmp_path, fmt):
+    source = without_layout(make_tone(tmp_path / "six.wav", seconds=1, layout="5.1"))
+    assert mn.probe(source, mn.Tools.find()).layout == ""
+    assert run(source, "-f", fmt) == 0
+    assert audio_stream(tmp_path / f"six (Nightcore).{fmt}")["channels"] == 6
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("layout, tones, expected", [
+    ("5.0", [250, 500, 750, 1000, 1250], [250, 500, 750, 0, 1000, 1250]),  # into 5.1
+    ("6.1", [250, 500, 750, 0, 1000, 1250, 1500], [250, 500, 750, 0, 1000, 1000, 1250, 1500]),
+])
+def test_opus_keeps_every_channel_in_its_place(tmp_path, layout, tones, expected):
+    source = tmp_path / "surround.flac"  # a different tone in each channel
+    ffmpeg("-f", "lavfi", "-i", "aevalsrc=" + "|".join(f"0.3*sin(2*PI*{f}*t)" for f in tones)
+           + f":c={layout}:s=48000:d=1", source)
+    assert run(source, "-f", "opus") == 0
+    rate, channels, values = samples(tmp_path / "surround (Nightcore).opus")
+    measured = []
+    for channel in range(channels):
+        part = values[channel::channels][rate // 10: rate * 7 // 10]
+        rising = sum(1 for a, b in zip(part, part[1:]) if a < 0 <= b)
+        loud = max(map(abs, part)) > 0.05
+        measured.append(rising / (len(part) / rate) / 1.25 if loud else 0)  # (0: silent)
+    assert measured == pytest.approx(expected, abs=3)
+
+
+@needs_ffmpeg
+def test_more_channels_than_opus_takes_are_downmixed(tmp_path):
+    source = tmp_path / "ten.wav"
+    ffmpeg("-f", "lavfi", "-i", "aevalsrc=" + "|".join(["0.5*sin(2*PI*440*t)"] * 10) + ":d=1",
+           "-c:a", "pcm_s16le", source)
+    without_layout(source)
+    assert mn.probe(source, mn.Tools.find()).layout == ""
+    if subprocess.run([FFMPEG, "-v", "quiet", "-i", source, "-ac", "2", "-f", "null", "-"]).returncode:
+        pytest.skip("this ffmpeg can't downmix channels without a layout (before 6.1)")
+    assert run(source, "-f", "opus") == 0
+    assert audio_stream(tmp_path / "ten (Nightcore).opus")["channels"] == 2
+
+
+@needs_ffmpeg
 def test_aac_keeps_side_channel_surround(tmp_path):
     source = make_tone(tmp_path / "surround.flac", seconds=1, layout="5.1(side)")
     assert run(source, "-f", "m4a") == 0
     assert audio_stream(tmp_path / "surround (Nightcore).m4a")["channel_layout"] == "5.1"
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("fmt", ["m4a", "opus", "flac"])
+@pytest.mark.parametrize("args", [[], ["--tempo", "1.2", "--engine", "atempo"]])
+def test_audio_that_starts_late_in_a_video_starts_at_once(tmp_path, fmt, args):
+    tone = make_tone(tmp_path / "tone.wav", seconds=1.5)
+    video = tmp_path / "clip.mkv"  # the audio starts half a second after the picture
+    ffmpeg("-f", "lavfi", "-i", "color=size=16x16:duration=2", "-itsoffset", "0.5", "-i", tone,
+           "-map", "0:v", "-map", "1:a", "-c:v", "ffv1", "-c:a", "flac", video)
+    assert float(audio_stream(video)["start_time"]) > 0.4
+    assert run(video, "-f", fmt, *args) == 0
+    output = tmp_path / f"clip (Nightcore).{fmt}"
+    stream = audio_stream(output)
+    assert float(stream.get("start_time", 0)) == pytest.approx(0, abs=0.001)
+    assert analyse(output)[0] == pytest.approx(1.5 / (1.2 if args else 1.25), abs=0.03)
 
 
 @needs_ffmpeg
@@ -1633,7 +1927,8 @@ def test_commands(tmp_path, monkeypatch, engine):
     encode = commands[-1]
     graph = encode[encode.index("-filter_complex") + 1]
     assert "aformat=sample_fmts=fltp," in graph.split("asetrate")[0]  # floating point first
-    assert encode[encode.index("-map_chapters") + 1] == "-1"
+    # Tags and chapters come from the metadata file.
+    assert encode[encode.index("-map_chapters") + 1] == encode[encode.index("-map_metadata") + 1]
     assert "-af" not in encode and "-metadata" not in encode
     assert "aformat=sample_fmts=dblp,bass=g=3" in graph  # a double-precision filter
     assert "alimiter=limit=0.989" in graph
@@ -1642,10 +1937,13 @@ def test_commands(tmp_path, monkeypatch, engine):
     if engine == "ffmpeg-rubberband":
         assert "pitchq=quality:channels=together" in graph
     if engine == "rubberband":
-        decode, (stretch, cwd) = commands[0], commands[1]
-        assert "volume=0.25" in decode
+        measure, decode, (stretch, cwd) = commands[:3]
+        assert "-f" in measure and "null" in measure  # measuring the peak
+        up = float(re.search(r"volume=([\d.]+)", " ".join(decode)).group(1))
+        down = float(re.search(r"volume=([\d.]+)", graph).group(1))
+        assert up == pytest.approx(2, rel=1e-3)  # the -18 dBFS tone goes to -12 dBFS...
+        assert up * down == pytest.approx(1, rel=1e-6)  # ...and back
         assert graph.startswith("[0:a:0]channelmap=channel_layout=5.1(side),")
-        assert "volume=4" in graph
         assert stretch[-2:] == ["decoded.wav", "stretched.wav"]
         assert Path(decode[-1]) == Path(cwd, "decoded.wav")
         assert all(flag in stretch for flag in mn._rubberband_flags(stretch[0]))
