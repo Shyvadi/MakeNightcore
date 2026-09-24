@@ -12,10 +12,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, python: "3.9" }
-          - { os: ubuntu-latest, python: "3.13" }
-          - { os: macos-latest, python: "3.13" }
-          - { os: windows-latest, python: "3.13" }
+          # The oldest supported setup: ffmpeg 4.4 and Rubber Band 2.0.
+          - { os: ubuntu-22.04, python: "3.8" }
+          - { os: ubuntu-latest, python: "3.x" }
+          # Homebrew's ffmpeg has no SoX resampler, Vorbis or rubberband filter.
+          - { os: macos-latest, python: "3.x" }
+          # Uses the Rubber Band bundled in this repository.
+          - { os: windows-latest, python: "3.x" }
     steps:
       - uses: actions/checkout@v4
 
@@ -33,7 +36,6 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ffmpeg rubberband
 
-      # On Windows, the tests use the Rubber Band bundled in this repository.
       - name: Install ffmpeg (Windows)
         if: runner.os == 'Windows'
         run: choco install ffmpeg -y --no-progress
