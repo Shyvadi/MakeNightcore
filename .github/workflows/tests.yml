@@ -1,0 +1,65 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20  # the suite takes a few minutes; a hang shouldn't take six hours
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.x" }
+          # Homebrew's ffmpeg has no SoX resampler, Vorbis or rubberband filter.
+          - { os: macos-latest, python: "3.x" }
+          # Uses the Rubber Band bundled in this repository, and Chocolatey's ffmpeg shim.
+          - { os: windows-latest, python: "3.x" }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install ffmpeg and Rubber Band (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # (Once more if a mirror is between updates.)
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg rubberband-cli ||
+            { sleep 30; sudo apt-get update; sudo apt-get install -y --no-install-recommends ffmpeg rubberband-cli; }
+
+      - name: Install ffmpeg and Rubber Band (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg rubberband
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - run: python -m pip install pytest
+
+      - run: python -m pytest -v
+
+  oldest:
+    # The oldest supported setup: Ubuntu 22.04's ffmpeg 4.4 and Rubber Band 2.0,
+    # with Python 3.8.
+    name: ffmpeg 4.4, Rubber Band 2.0, Python 3.8
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container: ubuntu:22.04
+    steps:
+      - name: Install ffmpeg, Rubber Band and uv
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ffmpeg rubberband-cli git ca-certificates curl ||
+            { sleep 30; apt-get update; apt-get install -y --no-install-recommends ffmpeg rubberband-cli git ca-certificates curl; }
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - uses: actions/checkout@v5
+
+      - run: ~/.local/bin/uv run --no-project --python 3.8 --with pytest python -m pytest -v
