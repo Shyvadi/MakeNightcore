@@ -28,8 +28,10 @@ jobs:
       - name: Install ffmpeg and Rubber Band (Linux)
         if: runner.os == 'Linux'
         run: |
+          # (Once more if a mirror is between updates.)
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg rubberband-cli
+          sudo apt-get install -y --no-install-recommends ffmpeg rubberband-cli ||
+            { sleep 30; sudo apt-get update; sudo apt-get install -y --no-install-recommends ffmpeg rubberband-cli; }
 
       - name: Install ffmpeg and Rubber Band (macOS)
         if: runner.os == 'macOS'
@@ -54,7 +56,8 @@ jobs:
       - name: Install ffmpeg, Rubber Band and uv
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends ffmpeg rubberband-cli git ca-certificates curl
+          apt-get install -y --no-install-recommends ffmpeg rubberband-cli git ca-certificates curl ||
+            { sleep 30; apt-get update; apt-get install -y --no-install-recommends ffmpeg rubberband-cli git ca-certificates curl; }
           curl -LsSf https://astral.sh/uv/install.sh | sh
 
       - uses: actions/checkout@v5

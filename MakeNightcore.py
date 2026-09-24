@@ -52,10 +52,12 @@ FORMATS = ("flac", "m4a", "mp3", "ogg", "opus", "wav")
 LOSSY_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)  # (MP3's and AAC's)
 COVER_ART_FORMATS = {".flac", ".m4a", ".mp3"}
 CHAPTER_FORMATS = {".m4a", ".mp3"}  # (ffmpeg writes Ogg chapters at the wrong times)
-# The channel layouts Opus and Vorbis can store, and ffmpeg's AAC encoder.
+# The channel layouts Opus and Vorbis can store, and AAC. (ffmpeg's AAC encoder
+# takes more, but before ffmpeg 8 writes them in a way nothing reads back.)
 OGG_LAYOUTS = {"mono", "stereo", "3.0", "quad", "5.0", "5.1", "6.1", "7.1"}
-AAC_LAYOUTS = OGG_LAYOUTS | {"2.1", "3.1", "4.0", "4.1", "6.0", "7.0", "7.1(wide)", "hexagonal",
-                             "octagonal"}
+AAC_LAYOUTS = {"mono", "stereo", "2.1", "3.0", "4.0", "quad", "5.0", "5.1", "7.1"}
+# Others it takes as one of those without mixing channels together.
+AAC_UPMIXES = {"3.1": "5.1", "4.1": "5.1", "6.0": "7.1", "6.1": "7.1", "7.0": "7.1"}
 # The layouts FLAC and Ogg give audio that doesn't name its own.
 USUAL_LAYOUTS = {1: "mono", 2: "stereo", 3: "3.0", 4: "quad", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}
 # Layouts that Opus, Vorbis and AAC only take with their side channels relabelled as back ones.
@@ -63,11 +65,15 @@ SIDES_AS_BACK = {"5.0(side)": "5.0", "5.1(side)": "5.1"}
 
 # Files picked up when a folder is given as input.
 INPUT_EXTENSIONS = {f".{fmt}" for fmt in FORMATS} | {
-    ".aac", ".aif", ".aifc", ".aiff", ".alac", ".ape", ".dff", ".dsf", ".m4b", ".mka",
-    ".mkv", ".mov", ".mp4", ".oga", ".tak", ".tta", ".webm", ".wma", ".wv",
+    ".aac", ".ac3", ".aif", ".aifc", ".aiff", ".alac", ".ape", ".caf", ".dff", ".dsf", ".dts",
+    ".eac3", ".m4b", ".mka", ".mkv", ".mov", ".mp2", ".mp4", ".mpc", ".oga", ".tak", ".tta",
+    ".w64", ".webm", ".wma", ".wv",
 }
 LOSSLESS_CODECS = {"alac", "ape", "dst", "flac", "mlp", "mp4als", "osq", "ralf", "s302m", "shorten",
                    "tak", "truehd", "tta", "wavpack", "wmalossless"}
+# Formats whose start ffmpeg moves to the streams it reads (AVFMT_TS_DISCONT):
+# there the audio already starts at 0.
+REBASED_FORMATS = {"dhav", "hls", "live_flv", "mpeg", "mpegts", "mpegtsraw", "ogg", "ty"}
 # Default output format for inputs whose own format can't be written back.
 CODEC_EXTENSIONS = {"aac": ".m4a", "alac": ".m4a", "flac": ".flac", "mp3": ".mp3",
                     "opus": ".opus", "vorbis": ".ogg"}
@@ -105,6 +111,8 @@ RUBBERBAND_INSTALL = """\
            with rubberband.exe and sndfile.dll to your PATH
   macOS:   brew install rubberband
   Linux:   sudo apt install rubberband-cli"""
+ATEMPO_WARNING = ("Rubber Band was not found, so the lower-quality atempo filter is used. "
+                  "To install Rubber Band:\n" + RUBBERBAND_INSTALL)
 
 
 class NightcoreError(Exception):
@@ -506,6 +514,7 @@ def probe(path: Path, tools: Tools) -> Source:
     guessed = layout == "unknown" or (channels == 1 and layout != "mono")  # (plain WAV, say)
     if guessed:
         layout = USUAL_LAYOUTS.get(channels, "")
+    rebased = set(info.get("format", {}).get("format_name", "").split(",")) & REBASED_FORMATS
     replaygain = (any(key.lower().startswith("replaygain_") for key in tags) or
                   any(d.get("side_data_type") == "Replay Gain" for d in audio.get("side_data_list", [])))
 
@@ -527,8 +536,8 @@ def probe(path: Path, tools: Tools) -> Source:
         cover_type=picture.get("tags", {}).get("comment", ""),
         chapters=tuple((_number(c.get("start_time")), _number(c.get("end_time")),
                         c.get("tags", {}).get("title", "")) for c in info.get("chapters", [])),
-        start=max(0.0, _number(audio.get("start_time"))
-                  - _number(info.get("format", {}).get("start_time"))),
+        start=0.0 if rebased else max(0.0, _number(audio.get("start_time"))
+                                      - _number(info.get("format", {}).get("start_time"))),
     )
 
 
@@ -606,7 +615,7 @@ class Codec:
     opus: bool = False
     downmix: bool = False   # to stereo: the format can't store the source's channels
     sides_as_back: bool = False  # the format needs side channels relabelled as back ones
-    upmix: str = ""         # a layout with one more channel, which the format needs
+    upmix: str = ""         # a bigger layout, which the format needs
 
 
 def output_codec(ext: str, source: Source, ffmpeg: str) -> Codec:
@@ -625,9 +634,10 @@ def output_codec(ext: str, source: Source, ffmpeg: str) -> Codec:
     def downmix(layouts: set) -> bool:
         return source.layout not in layouts and source.layout not in SIDES_AS_BACK
     if ext == ".m4a":
-        mix = downmix(AAC_LAYOUTS)
+        upmix = AAC_UPMIXES.get(source.layout, "")
+        mix = downmix(AAC_LAYOUTS) and not upmix
         return Codec(("-c:a", "aac", "-b:a", f"{128 * (2 if mix else source.channels)}k",
-                      "-movflags", "+faststart"), downmix=mix, sides_as_back=True)
+                      "-movflags", "+faststart"), downmix=mix, sides_as_back=True, upmix=upmix)
     encoders = _ffmpeg_list(ffmpeg, "-encoders")
     if ext == ".mp3":
         codec = Codec(("-c:a", "libmp3lame", "-q:a", "0"), downmix=source.channels > 2)  # LAME V0
@@ -671,6 +681,8 @@ def _output_rate(rate: int, codec: Codec) -> int:
     if codec.opus:
         return 48000  # Opus only works at 48 kHz
     if codec.lossless:
+        while rate > 384000:  # (DSD decodes at up to 1.4 MHz: more than FLAC takes)
+            rate //= 2
         return rate
     if rate > 48000:
         return 48000 if rate % 48000 == 0 else 44100  # lossy codecs gain nothing above 48 kHz
@@ -717,6 +729,10 @@ def audio_filters(source: Source, effect: Effect, engine: str, codec: Codec, ffm
         # Name the layout: a WAV copy made by Rubber Band lost it, and a file that
         # doesn't name it gets the usual one (not ffmpeg's guess: see probe).
         chain.append(f"channelmap=channel_layout={source.layout}")
+    if source.layout and not source.guessed:
+        # Parts of a recording in another layout (TV adverts in stereo, say) are
+        # converted to the one it is known by, normalized so they can't clip.
+        chain += ["aresample=rematrix_maxval=1", f"aformat=channel_layouts={source.layout}"]
     if source.start > 0.001 and not decoded:
         # Start at once where the audio starts late in its file (in a video, say).
         # (Not with STARTPTS: ffmpeg rebuilds the filters when the format changes.)
@@ -780,9 +796,17 @@ def _limiter(ffmpeg: str, ceiling: float, rate: int) -> str:
 
 
 def _decode(source: Source, output: Path, tools: Tools, verbose: bool,
-            progress: Callable[[float], None] | None, gains: Sequence[float] = (1.0,)) -> Path:
-    """Decode the audio to a floating-point WAV file, times `gains` (see _ride)."""
-    return _amplify(source.path, output, gains, source, 1, tools, verbose, progress)
+            progress: Callable[[float], None] | None) -> Path:
+    """Decode the audio to a floating-point WAV file: in one format throughout,
+    with no gaps in time. (A later part at another rate is converted, well.)"""
+    same = _resample(source.sample_rate, _has_soxr(tools.ffmpeg), source.sample_rate)
+    if source.layout and not source.guessed:  # (normalized, and not ffmpeg's guess: see probe)
+        same += f",aresample=rematrix_maxval=1,aformat=channel_layouts={source.layout}"
+    _run([tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", source.path,
+          "-map", "0:a:0", "-map_metadata", "-1", "-af", same,
+          "-c:a", "pcm_f32le", "-rf64", "auto", output],
+         verbose=verbose, duration=source.duration, progress=progress)
+    return output
 
 
 # Rubber Band's output can't go over full scale, and time-stretched audio peaks up
@@ -794,11 +818,15 @@ RIDE_RATE = 20  # gains per second
 CURVE_RATE = 400  # values per second in the files that take them to ffmpeg
 
 
-def _levels(source: Source, workdir: Path, tools: Tools, verbose: bool,
+def _levels(audio: Path, source: Source, workdir: Path, tools: Tools, verbose: bool,
             progress: Callable[[float], None] | None) -> list[float]:
-    """The audio's peak in each 1/20 s ([] if ffmpeg doesn't say)."""
+    """The peak in each 1/20 s of a decoded copy ([] if ffmpeg doesn't say).
+
+    (Not of the source: where its format changes, ffmpeg would set the filters
+    up again, and start the file over.)
+    """
     block = max(1, round(source.sample_rate / RIDE_RATE))
-    _run([tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", source.path,
+    _run([tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", audio,
           "-map", "0:a:0", "-af", f"asetnsamples=n={block},astats=metadata=1:reset=1:"
           "measure_perchannel=none:measure_overall=Peak_level,ametadata=mode=print:"
           "key=lavfi.astats.Overall.Peak_level:file=levels.txt", "-f", "null", "-"],
@@ -828,8 +856,8 @@ def _ride(levels: Sequence[float]) -> list[float]:
 
 def _amplify(audio: Path, output: Path, gains: Sequence[float], source: Source, speed: float,
              tools: Tools, verbose: bool, progress: Callable[[float], None] | None) -> Path:
-    """Write `audio` times `gains` (per 1/20 s, which `speed` moves to 1/20/speed s)
-    to a floating-point WAV file."""
+    """Write the decoded copy `audio` times `gains` (per 1/20 s, which `speed`
+    moves to 1/20/speed s) to a floating-point WAV file."""
     cmd = [tools.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", audio]
     if len(set(gains)) == 1:
         graph = f"[0:a:0]volume={gains[0]:.8g}[out]"
@@ -845,14 +873,13 @@ def _amplify(audio: Path, output: Path, gains: Sequence[float], source: Source, 
         if sys.byteorder == "big":
             curve.byteswap()
         output.with_suffix(".gain").write_bytes(curve.tobytes())
-        # Every channel times the curve, both in the audio's own layout. (A copy
-        # made by Rubber Band has lost it: see audio_filters. And pan can't make
-        # every layout itself.)
+        # Every channel times the curve, both in the audio's own layout. (A WAV
+        # copy may have lost it: see audio_filters. And pan can't make every
+        # layout itself.)
         layout = f"channelmap=channel_layout={source.layout}"
-        relabel = layout if audio != source.path or source.guessed else "anull"
         spread = "|".join(f"c{channel}=c0" for channel in range(source.channels))
         cmd += ["-f", "f32le", "-ar", str(CURVE_RATE), "-i", output.with_suffix(".gain")]
-        graph = (f"[0:a:0]{relabel}[audio];[1:a]aresample={source.sample_rate},"
+        graph = (f"[0:a:0]{layout}[audio];[1:a]aresample={source.sample_rate},"
                  f"pan={source.channels}c|{spread},{layout}[gain];[audio][gain]amultiply[out]")
     _run([*cmd, "-filter_complex", graph, "-map", "[out]", "-map_metadata", "-1",
           "-c:a", "pcm_f32le", "-rf64", "auto", output],
@@ -864,10 +891,13 @@ def _stretch_with_rubberband(source: Source, effect: Effect, rubberband: str, wo
                              tools: Tools, verbose: bool, steps: _Progress) -> Path:
     """Time-stretch with the Rubber Band program, on a decoded copy: it can't
     read most formats, and the copy gets the levels it needs (see RIDE_RATE)."""
-    gains = _ride(_levels(source, workdir, tools, verbose, steps.stage(0.03)))
+    plain = _decode(source, workdir / "plain.wav", tools, verbose, steps.stage(0.03))
+    gains = _ride(_levels(plain, source, workdir, tools, verbose, steps.stage(0.02)))
     if not source.layout:  # (more than 8 channels: ffmpeg before 6.1 can't spread a curve)
         gains = [min(gains)]
-    decoded = _decode(source, workdir / "decoded.wav", tools, verbose, steps.stage(0.05), gains)
+    decoded = _amplify(plain, workdir / "decoded.wav", gains, source, 1, tools, verbose,
+                       steps.stage(0.03))
+    plain.unlink()
     stretched = workdir / "stretched.wav"
     # File names relative to the work folder: on Windows, Rubber Band can only
     # open paths that fit the system code page, and the temp folder may not.
@@ -1085,10 +1115,25 @@ def _same_file(a: Path, b: Path) -> bool:
 def _check_target(source: Path, target: Path, overwrite: bool) -> None:
     if target == source or _same_file(target, source):
         raise NightcoreError("the output would replace the source file")
+    if os.name == "nt" and _name_length(str(target), windows=True) > 259 and not _long_paths():
+        # (Found out now, not after the encode, when it couldn't be put in place.)
+        raise NightcoreError(f"the path of {target.name} would be too long for Windows (260 "
+                             "characters or more); put the result in a shorter folder with -o")
     if target.is_dir():
         raise NightcoreError(f"the output {target} is a folder")
     if target.exists() and not overwrite:
         raise NightcoreError(f"{target.name} already exists (use -y to overwrite)")
+
+
+def _long_paths() -> bool:
+    """Whether Windows is set to take paths of 260 characters or more."""
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Control\FileSystem") as key:
+            return bool(winreg.QueryValueEx(key, "LongPathsEnabled")[0])
+    except OSError:
+        return False
 
 
 def nightcore(source: str | os.PathLike, output: str | os.PathLike | None = None, *,
@@ -1116,9 +1161,12 @@ def nightcore(source: str | os.PathLike, output: str | os.PathLike | None = None
     source_path = Path(os.path.abspath(source))
     info = probe(source_path, tools)
     folder = output is not None and _is_folder(output)
-    target = plan_output(info, output and Path(os.path.abspath(output)), fmt, effect, folder)
+    target = plan_output(info, Path(os.path.abspath(output)) if output else None, fmt, effect,
+                         folder)  # ("" as with -o "")
     _check_target(source_path, target, overwrite)
     chosen, rubberband = choose_engine(effect, engine, tools)
+    if chosen == "atempo" and engine == "auto":
+        warnings.warn(ATEMPO_WARNING, stacklevel=2)
     for message in render(info, target, effect, chosen, tools, rubberband=rubberband,
                           overwrite=overwrite):
         warnings.warn(message, stacklevel=2)
@@ -1259,10 +1307,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="pitch shift in semitones, without changing the tempo (default: 0)")
     effect.add_argument("--bass", type=_number_in(BASS_RANGE), default=0.0, metavar="DB",
                         help="bass boost in dB, e.g. 6 (default: off)")
-    effect.add_argument("--engine", choices=ENGINES, default="auto",
-                        help="time-stretcher for --tempo/--pitch: the Rubber Band program, "
-                             "ffmpeg's rubberband filter, or ffmpeg's lower-quality atempo "
-                             "(default: best available)")
+    effect.add_argument("--engine", choices=ENGINES, default="auto", metavar="NAME",
+                        help="time-stretcher for --tempo/--pitch: rubberband (the Rubber Band "
+                             "program), ffmpeg-rubberband (ffmpeg's rubberband filter) or atempo "
+                             "(ffmpeg's, lower quality) (default: auto, the best available)")
 
     parser.add_argument("-y", "--overwrite", action="store_true",
                         help="overwrite existing output files")
@@ -1457,8 +1505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
            "atempo": "time-stretched with ffmpeg's atempo"}[engine]
     status.info(f"{effect.label}: {effect.describe()}, {how}")
     if engine == "atempo" and args.engine == "auto":
-        _say("warning: Rubber Band was not found, so the lower-quality atempo filter is used. "
-             "To install Rubber Band:\n" + RUBBERBAND_INSTALL, stream=sys.stderr)
+        _say(f"warning: {ATEMPO_WARNING}", stream=sys.stderr)
 
     done, failed, skipped = 0, len(errors), len(earlier) + len(unmatched)
     planned, written = set(), set()

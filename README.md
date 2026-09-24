@@ -69,7 +69,7 @@ Version 1 of this tool time-stretched with `rubberband -t 0.85 -p 3`. To get the
 ## What you get
 
 - **Quality.**
-  - Lossless files stay lossless, at their bit depth and sample rate. 16-bit stays 16-bit (dithered), 24-bit stays 24-bit, and 32-bit float WAV stays float. Apple Lossless (ALAC) stays ALAC.
+  - Lossless files stay lossless, at their bit depth and sample rate. 16-bit stays 16-bit (dithered), 24-bit stays 24-bit, and 32-bit float WAV stays float. Apple Lossless (ALAC) stays ALAC. DSD becomes 24-bit PCM, at up to 352.8 kHz.
   - Lossy formats are encoded at transparent settings: MP3 V0, Vorbis q6, and AAC 256k or Opus 192k for stereo (scaled with the number of channels). If your ffmpeg has no Vorbis encoder, Ogg files are written with Opus.
   - Surround sound keeps its channels. It is downmixed to stereo for MP3, and in M4A, Ogg and Opus files for layouts those can't store.
   - All processing happens in floating point.
