@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "makenightcore"
+version = "2.0.0"
+description = "Make nightcore versions of songs: faster and higher, like a record played at the wrong speed."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Shyvadi" }]
+keywords = ["nightcore", "audio", "ffmpeg", "music", "pitch", "tempo"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Conversion",
+]
+
+[project.scripts]
+makenightcore = "MakeNightcore:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+py-modules = ["MakeNightcore"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

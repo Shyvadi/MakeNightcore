@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}, Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: macos-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.13" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install ffmpeg and Rubber Band (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg rubberband-cli
+
+      - name: Install ffmpeg and Rubber Band (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg rubberband
+
+      # On Windows, the tests use the Rubber Band bundled in this repository.
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - run: python -m pip install pytest
+
+      - run: python -m pytest -v
